@@ -1,0 +1,79 @@
+name: CI and publish
+
+# Tests every push/PR on all platforms; publishes to PyPI only when a GitHub
+# Release is published. PyPI Trusted Publishing is configured for this exact
+# repo + workflow file (workflow.yml) + environment (pypi).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64 }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64 }
+          - { name: macos-arm64, runner: macos-latest }
+          - { name: windows-x86_64, runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # One abi3 wheel per platform covers every CPython >= 3.10.
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - name: Install the built wheel and run the tests against it
+        shell: bash
+        run: |
+          python -m pip install pytest hypothesis
+          python -m pip install --no-index --find-links dist jsbox
+          python -m pytest tests -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI (Trusted Publishing)
+    if: github.event_name == 'release'
+    needs: [wheel, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/jsbox
+    permissions:
+      id-token: write  # OIDC for Trusted Publishing, no API token secret
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

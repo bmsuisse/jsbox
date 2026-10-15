@@ -1,0 +1,21 @@
+[package]
+name = "jsbox"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/bmsuisse/jsbox"
+description = "Embedded JavaScript for Python, powered by QuickJS (rquickjs) and Rust."
+
+[lib]
+name = "_jsbox"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["abi3-py310", "extension-module"] }
+rquickjs = { version = "0.9", features = ["loader"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

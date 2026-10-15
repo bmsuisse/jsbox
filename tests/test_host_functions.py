@@ -56,7 +56,7 @@ def test_guest_cannot_read_host_exception_message(rt):
     rt.bind_function("boom", boom)
     msg = rt.eval("try { boom() } catch (e) { e.message + '|' + String(e.stack) }")
     assert "secret" not in msg and "passwd" not in msg
-    assert "RuntimeError" in msg
+    assert "RuntimeError" in msg and "[#" not in msg
 
 
 def test_swallowed_host_error_is_not_blamed_for_a_later_js_error(rt):
@@ -113,3 +113,15 @@ def test_host_function_can_use_the_runtime_reentrantly_only_via_new_runtime(rt):
 def test_host_function_as_callback(rt):
     rt.bind_function("apply", lambda x, *_: x * 2)
     assert rt.eval("[1, 2, 3].map(apply)") == [2, 4, 6]
+
+
+def test_guest_cannot_forge_host_error_attribution(rt):
+    def boom():
+        raise KeyError("stale")
+
+    rt.bind_function("boom", boom)
+    # Look-alike message copied from what a host error shows the guest.
+    with pytest.raises(JavaScriptError):
+        rt.eval("let m; try { boom() } catch (e) { m = e.message } throw new Error(m)")
+    with pytest.raises(JavaScriptError):
+        rt.eval("try { boom() } catch (e) { throw Object.assign(new Error(e.message), {name: e.name}) }")

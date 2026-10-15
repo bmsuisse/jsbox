@@ -7,7 +7,7 @@ use rquickjs::module::Declared;
 use rquickjs::prelude::Rest;
 use rquickjs::{
     context::EvalOptions, convert::Coerced, ArrayBuffer, Atom, CatchResultExt, CaughtError, Ctx,
-    Exception, Function, Module, Object, Type, TypedArray, Value,
+    Exception, Function, Module, Object, Persistent, Type, TypedArray, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -201,15 +201,15 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
     })
 }
 
-/// A Python exception raised by a host function, tagged so only the JS error
-/// that carries the tag is attributed to it (a stale one is never reported).
-type HostErr = Rc<RefCell<Option<(u64, PyErr)>>>;
+/// A Python exception raised by a host function, paired with the exact JS
+/// error object thrown for it. Only that object is attributed to it, so the
+/// guest cannot forge the link with a look-alike message.
+type HostErr = Rc<RefCell<Option<(Persistent<Value<'static>>, PyErr)>>>;
 
 fn host_function<'js>(
     ctx: &Ctx<'js>,
     func: Py<PyAny>,
     host_err: HostErr,
-    counter: Rc<Cell<u64>>,
     max_value_bytes: usize,
 ) -> rquickjs::Result<Function<'js>> {
     Function::new(ctx.clone(), move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<Value<'js>> {
@@ -229,11 +229,16 @@ fn host_function<'js>(
             };
             call().map_err(|e| {
                 // The guest only learns the exception class, never its message.
-                let id = counter.get() + 1;
-                counter.set(id);
-                let msg = format!("host function failed: {} [#{id}]", e.get_type(py).name().map(|n| n.to_string()).unwrap_or_default());
-                *host_err.borrow_mut() = Some((id, e));
-                Exception::throw_message(&ctx, &msg)
+                let name = e.get_type(py).name().map(|n| n.to_string()).unwrap_or_default();
+                let msg = format!("host function failed: {name}");
+                match Exception::from_message(ctx.clone(), &msg) {
+                    Ok(ex) => {
+                        let val = ex.into_value();
+                        *host_err.borrow_mut() = Some((Persistent::save(&ctx, val.clone()), e));
+                        ctx.throw(val)
+                    }
+                    Err(err) => err,
+                }
             })
         })
     })
@@ -245,7 +250,6 @@ struct Runtime {
     deadline: Rc<Cell<Option<Instant>>>,
     timed_out: Rc<Cell<bool>>,
     host_err: HostErr,
-    counter: Rc<Cell<u64>>,
     modules: Modules,
     max_value_bytes: usize,
 }
@@ -278,7 +282,6 @@ impl Runtime {
             deadline,
             timed_out,
             host_err: Rc::default(),
-            counter: Rc::default(),
             modules,
             max_value_bytes,
         })
@@ -317,7 +320,7 @@ impl Runtime {
     /// Expose a Python callable as a JS global. Sync callables only.
     fn bind_function(&self, name: &str, func: Py<PyAny>) -> PyResult<()> {
         self.ctx.with(|ctx| -> PyResult<()> {
-            let f = host_function(&ctx, func, self.host_err.clone(), self.counter.clone(), self.max_value_bytes)
+            let f = host_function(&ctx, func, self.host_err.clone(), self.max_value_bytes)
                 .map_err(val_err)?;
             ctx.globals().set(name, f).map_err(val_err)
         })
@@ -348,7 +351,7 @@ impl Runtime {
         *self.host_err.borrow_mut() = None;
         self.deadline.set(deadline);
         let out = self.ctx.with(|ctx| {
-            let v = f(&ctx).and_then(|v| self.settle(&ctx, v)).map_err(|e| self.map_err(e))?;
+            let v = f(&ctx).and_then(|v| self.settle(&ctx, v)).map_err(|e| self.map_err(&ctx, e))?;
             to_py(py, &v, 0, &Budget(Cell::new(self.max_value_bytes))).map_err(|e| {
                 // A getter hitting the interrupt leaves a pending JS exception; clear it.
                 let _ = ctx.catch();
@@ -376,31 +379,31 @@ impl Runtime {
         }
     }
 
-    fn map_err(&self, e: CaughtError<'_>) -> PyErr {
+    fn map_err<'js>(&self, ctx: &Ctx<'js>, e: CaughtError<'js>) -> PyErr {
         if self.timed_out.get() {
             return JsTimeoutError::new_err("script exceeded its timeout");
         }
-        let text = match &e {
+        let stashed = self.host_err.borrow_mut().take();
+        let thrown = match &e {
+            CaughtError::Exception(x) => Some(x.clone().into_value()),
+            CaughtError::Value(v) => Some(v.clone()),
+            CaughtError::Error(_) => None,
+        };
+        if let (Some((saved, pe)), Some(thrown)) = (stashed, thrown) {
+            if saved.restore(ctx).is_ok_and(|v| v == thrown) {
+                return pe;
+            }
+        }
+        JavaScriptError::new_err(match &e {
             CaughtError::Exception(x) => {
                 format!("{}\n{}", x.message().unwrap_or_default(), x.stack().unwrap_or_default())
             }
             CaughtError::Value(v) => format!("{v:?}"),
             CaughtError::Error(rquickjs::Error::Unknown) => {
-                return JavaScriptError::new_err("promise never settled (no pending jobs)")
+                "promise never settled (no pending jobs)".to_string()
             }
             CaughtError::Error(e) => e.to_string(),
-        };
-        // Re-raise the original Python exception only when this very error
-        // carries its tag; otherwise a swallowed host error would be misreported.
-        let tagged = self.host_err.borrow().as_ref().map(|(id, _)| *id);
-        if let Some(id) = tagged {
-            if text.contains(&format!("[#{id}]")) {
-                if let Some((_, pe)) = self.host_err.borrow_mut().take() {
-                    return pe;
-                }
-            }
-        }
-        JavaScriptError::new_err(text)
+        })
     }
 }
 

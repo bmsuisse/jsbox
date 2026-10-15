@@ -130,8 +130,11 @@ it can *do* is exactly what you bound.
 - **Heap, stack and copy limits with safe defaults.** `memory_limit` (64 MB), `max_stack_size`
   (1 MB), `max_value_bytes` (16 MB per conversion). Pass `0` to `memory_limit` or
   `max_stack_size` to disable them.
-- **Timeouts you cannot swallow.** `timeout=` interrupts at the engine level; `try/catch` in the
+- **Timeouts you cannot swallow.** `timeout=` interrupts the interpreter loop; `try/catch` in the
   guest cannot catch it, and it also covers property getters hit while converting the result.
+  **It cannot interrupt a single long native operation**: a catastrophic regular expression
+  (`/^(a+)+$/.test('a'.repeat(40) + 'b')`) runs to completion, and some builtins (huge `BigInt`
+  powers) overshoot the deadline. See below.
 - **Host errors are not guest-readable**, and a swallowed host error is never blamed on a later,
   unrelated JS error.
 - **Isolated runtimes.** Two `Runtime`s share nothing; a `Runtime` is bound to its thread.
@@ -139,8 +142,9 @@ it can *do* is exactly what you bound.
 What this is **not**: QuickJS is a C engine in your process. A memory-safety bug in it is a bug
 in your process, so for hostile multi-tenant workloads also use OS-level isolation (a container
 or a separate process). Bound host functions are privileged code you wrote, so keep them narrow.
-A timeout cannot interrupt a Python callback that is itself stuck; it fires as soon as that
-callback returns.
+A timeout cannot interrupt a Python callback that is itself stuck (it fires as soon as that
+callback returns), nor a runaway regular expression: **for untrusted code, run the `Runtime` in
+a process you can kill** (or reject patterns up front). A built-in hard kill is the open item.
 
 ## Limitations
 

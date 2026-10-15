@@ -123,3 +123,13 @@ def test_value_within_budget_is_fine():
 def test_promise_that_never_settles_is_an_error_not_a_hang(rt):
     with pytest.raises(JavaScriptError, match="never settled"):
         rt.eval("new Promise(() => {})")
+
+
+@pytest.mark.xfail(
+    run=False,
+    reason="known limitation: QuickJS regex backtracking never checks the interrupt handler, "
+    "so catastrophic patterns outlive any timeout (see README, Security model)",
+)
+def test_regex_redos_is_not_interruptible(rt):
+    with pytest.raises(JsTimeoutError):
+        rt.eval("/^(a+)+$/.test('a'.repeat(40) + 'b')", timeout=0.3)

@@ -125,3 +125,56 @@ def test_guest_cannot_forge_host_error_attribution(rt):
         rt.eval("let m; try { boom() } catch (e) { m = e.message } throw new Error(m)")
     with pytest.raises(JavaScriptError):
         rt.eval("try { boom() } catch (e) { throw Object.assign(new Error(e.message), {name: e.name}) }")
+
+
+def _survives(code):
+    import subprocess, sys
+
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+
+
+def test_dropping_a_runtime_after_a_swallowed_host_error_does_not_abort():
+    _survives(
+        """
+import gc
+from jsbox import Runtime
+for _ in range(100):
+    rt = Runtime()
+    rt.bind_function("boom", lambda: 1 / 0)
+    rt.eval("try { boom() } catch (e) {}; 1")
+    del rt
+gc.collect()
+"""
+    )
+
+
+def test_repeated_swallowed_host_errors_then_drop_does_not_abort():
+    _survives(
+        """
+from jsbox import Runtime
+rt = Runtime()
+rt.bind_function("boom", lambda: 1 / 0)
+rt.eval("for (let i = 0; i < 1000; i++) { try { boom() } catch (e) {} }")
+try:
+    rt.eval("boom()")
+except ZeroDivisionError:
+    pass
+del rt
+"""
+    )
+
+
+def test_host_error_then_non_exception_failure_does_not_abort():
+    _survives(
+        """
+from jsbox import Runtime, JsTimeoutError
+rt = Runtime()
+rt.bind_function("boom", lambda: 1 / 0)
+try:
+    rt.eval("try { boom() } catch (e) {}; while (true) {}", timeout=0.1)
+except JsTimeoutError:
+    pass
+del rt
+"""
+    )

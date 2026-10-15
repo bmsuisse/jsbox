@@ -206,6 +206,16 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
 /// guest cannot forge the link with a look-alike message.
 type HostErr = Rc<RefCell<Option<(Persistent<Value<'static>>, PyErr)>>>;
 
+/// `Persistent` has no `Drop`: letting one fall out of scope leaks its JS value
+/// and QuickJS aborts the process when the runtime is freed. Every stash must
+/// be restored (and the restored value dropped) inside the context instead.
+fn clear_stash<'js>(ctx: &Ctx<'js>, host_err: &HostErr) {
+    let stashed = host_err.borrow_mut().take();
+    if let Some((saved, _py_err)) = stashed {
+        let _ = saved.restore(ctx);
+    }
+}
+
 fn host_function<'js>(
     ctx: &Ctx<'js>,
     func: Py<PyAny>,
@@ -234,6 +244,7 @@ fn host_function<'js>(
                 match Exception::from_message(ctx.clone(), &msg) {
                     Ok(ex) => {
                         let val = ex.into_value();
+                        clear_stash(&ctx, &host_err);
                         *host_err.borrow_mut() = Some((Persistent::save(&ctx, val.clone()), e));
                         ctx.throw(val)
                     }
@@ -335,6 +346,12 @@ impl Runtime {
     }
 }
 
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        Python::attach(|_| self.ctx.with(|ctx| clear_stash(&ctx, &self.host_err)));
+    }
+}
+
 impl Runtime {
     fn run<'a>(
         &self,
@@ -348,9 +365,24 @@ impl Runtime {
             Some(_) => return Err(PyValueError::new_err("timeout must be a finite number >= 0")),
         };
         self.timed_out.set(false);
-        *self.host_err.borrow_mut() = None;
         self.deadline.set(deadline);
         let out = self.ctx.with(|ctx| {
+            clear_stash(&ctx, &self.host_err);
+            let r = self.run_in(py, &ctx, f);
+            clear_stash(&ctx, &self.host_err);
+            r
+        });
+        self.deadline.set(None);
+        out
+    }
+
+    fn run_in<'js>(
+        &self,
+        py: Python<'_>,
+        ctx: &Ctx<'js>,
+        f: impl FnOnce(&Ctx<'js>) -> Result<Value<'js>, CaughtError<'js>>,
+    ) -> PyResult<Py<PyAny>> {
+        {
             let v = f(&ctx).and_then(|v| self.settle(&ctx, v)).map_err(|e| self.map_err(&ctx, e))?;
             to_py(py, &v, 0, &Budget(Cell::new(self.max_value_bytes))).map_err(|e| {
                 // A getter hitting the interrupt leaves a pending JS exception; clear it.
@@ -361,9 +393,7 @@ impl Runtime {
                     e
                 }
             })
-        });
-        self.deadline.set(None);
-        out
+        }
     }
 
     /// Drain microtasks until a returned promise settles.
@@ -383,14 +413,18 @@ impl Runtime {
         if self.timed_out.get() {
             return JsTimeoutError::new_err("script exceeded its timeout");
         }
-        let stashed = self.host_err.borrow_mut().take();
+        let stashed = self
+            .host_err
+            .borrow_mut()
+            .take()
+            .map(|(saved, pe)| (saved.restore(ctx).ok(), pe));
         let thrown = match &e {
             CaughtError::Exception(x) => Some(x.clone().into_value()),
             CaughtError::Value(v) => Some(v.clone()),
             CaughtError::Error(_) => None,
         };
-        if let (Some((saved, pe)), Some(thrown)) = (stashed, thrown) {
-            if saved.restore(ctx).is_ok_and(|v| v == thrown) {
+        if let (Some((Some(saved), pe)), Some(thrown)) = (stashed, thrown) {
+            if saved == thrown {
                 return pe;
             }
         }

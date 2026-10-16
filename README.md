@@ -89,6 +89,10 @@ print(rt.eval("({ok: true, rows: [1, 2, 3]})"))  # {'ok': True, 'rows': [1, 2, 3
 Anything else (functions, symbols, `Date`, non-`str` dict keys, cycles) raises instead of being
 silently mangled.
 
+### Syntax check
+
+`rt.check_syntax(code)` (or `module=True`) parses without running and raises `JavaScriptError` (`SyntaxError`) if invalid.
+
 ### Promises
 
 A script that returns a promise is settled by draining microtasks, so `async`/`await` works.

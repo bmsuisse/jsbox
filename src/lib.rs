@@ -9,7 +9,7 @@ use rquickjs::module::Declared;
 use rquickjs::prelude::Rest;
 use rquickjs::{
     context::EvalOptions, convert::Coerced, ArrayBuffer, Atom, CatchResultExt, CaughtError, Ctx,
-    Exception, Function, Module, Object, Persistent, Promise, Type, TypedArray, Value,
+    Constructor, Exception, Function, Module, Object, Persistent, Promise, Type, TypedArray, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -559,6 +559,22 @@ impl Runtime {
             p.finish::<()>().catch(ctx)?;
             Ok(m.namespace().catch(ctx)?.into_value())
         })
+    }
+
+    /// Parse `code` without running it; raises `JavaScriptError` (SyntaxError) if invalid.
+    /// Scripts are checked as a function body, so top-level `return` is accepted.
+    #[pyo3(signature = (code, module=false))]
+    fn check_syntax(&self, py: Python<'_>, code: &str, module: bool) -> PyResult<()> {
+        self.run(py, None, |ctx| {
+            if module {
+                Module::declare(ctx.clone(), "check", code).catch(ctx)?;
+            } else {
+                let f: Constructor = ctx.globals().get("Function").catch(ctx)?;
+                f.construct::<_, Value>((code,)).catch(ctx)?;
+            }
+            Ok(Value::new_undefined(ctx.clone()))
+        })
+        .map(|_| ())
     }
 
     fn add_static_module(&self, name: &str, source: &str) {

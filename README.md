@@ -196,6 +196,9 @@ a process you can kill** (or reject patterns up front). A built-in hard kill is 
 ## Limitations
 
 - `TextEncoder`/`TextDecoder` (UTF-8) and `btoa`/`atob` are built in and native.
+- `Runtime(buffer=True)` adds a small Node-style `Buffer` (UTF-8, latin1, base64, hex). It is off by
+  default because it is ambient API surface; turn it on for JSZip-based libraries such as
+  pptxgenjs, which then take their native UTF-8 path (about 20% faster on a 20-slide deck).
 - No timers (`setTimeout`), `fetch`, or `Date`/`Map`/`Set` conversion yet. Libraries that only
   use timers to yield work with a microtask shim.
 - Interpreter speed: it is not a JIT. CPU-bound JavaScript runs roughly 4-8x slower than V8 (a

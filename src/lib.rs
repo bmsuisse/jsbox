@@ -256,6 +256,41 @@ fn host_failure<'js>(ctx: &Ctx<'js>, host_err: &HostErr, py: Python<'_>, e: PyEr
     Ok(val)
 }
 
+/// JS that rewrites `Set`/`Map`/`Date` inside a result to arrays/objects/ISO strings.
+/// It captures the intrinsics at start-up, so a guest that overwrites `Set` or
+/// `Object` cannot change how its own result is read.
+const PLAIN_JS: &str = r#"(function () {
+  const S = Set, M = Map, D = Date, isArr = Array.isArray, keys = Object.keys, getProto = Object.getPrototypeOf;
+  const OP = Object.prototype, isView = ArrayBuffer.isView, sHas = S.prototype.has, mHas = M.prototype.has;
+  const sVals = S.prototype.values, mEnt = M.prototype.entries, iso = D.prototype.toISOString, time = D.prototype.getTime;
+  const from = Array.from, call = Function.prototype.call.bind(Function.prototype.call);
+  const brand = (fn, x) => { try { call(fn, x, 0); return true; } catch (_e) { return false; } };
+  const seen = new WeakSet();
+  function plain(x, d) {
+    if (x === null || typeof x !== 'object' || d > 64 || isView(x) || seen.has(x)) return x;
+    seen.add(x);
+    try {
+      if (isArr(x)) { const out = new Array(x.length); for (let i = 0; i < x.length; i++) out[i] = plain(x[i], d + 1); return out; }
+      const proto = getProto(x);
+      if (proto !== OP && proto !== null) {
+        if (brand(sHas, x)) return from(call(sVals, x), (e) => plain(e, d + 1));
+        if (brand(mHas, x)) { const out = {}; for (const [k, v] of call(mEnt, x)) out[String(k)] = plain(v, d + 1); return out; }
+        try { const t = call(time, x); return t === t ? call(iso, x) : null; } catch (_e) { /* not a Date */ }
+        return x;
+      }
+      const out = {}; for (const k of keys(x)) out[k] = plain(x[k], d + 1); return out;
+    } finally { seen.delete(x); }
+  }
+  return (x) => plain(x, 0);
+})()"#;
+
+struct Plain<'js>(Function<'js>);
+
+// SAFETY: `Plain` only holds a `Function<'js>`, which is itself covariant in `'js` the way rquickjs requires.
+unsafe impl<'js> rquickjs::JsLifetime<'js> for Plain<'js> {
+    type Changed<'to> = Plain<'to>;
+}
+
 /// A pending awaitable started by an async host function. The persistents are
 /// restored in `Asy::release`; never just dropped (see `clear_stash`).
 struct Pending {
@@ -476,7 +511,19 @@ impl Runtime {
         let modules: Modules = Rc::default();
         rt.set_loader(StaticResolver(modules.clone()), StaticLoader(modules.clone()));
         let ctx = rquickjs::Context::full(&rt).map_err(val_err)?;
-        ctx.with(|ctx| install_console(&ctx, on_console, max_value_bytes).and_then(|()| install_web_bytes(&ctx)).and_then(|()| natives::install(&ctx, buffer))).map_err(val_err)?;
+        ctx.with(|ctx| {
+            install_console(&ctx, on_console, max_value_bytes)
+                .and_then(|()| install_web_bytes(&ctx))
+                .and_then(|()| natives::install(&ctx, buffer))
+                .and_then(|()| {
+                    if lossy {
+                        let f: Function = ctx.eval(PLAIN_JS)?;
+                        let _ = ctx.store_userdata(Plain(f));
+                    }
+                    Ok(())
+                })
+        })
+        .map_err(val_err)?;
         Ok(Self {
             ctx,
             deadline,
@@ -677,6 +724,15 @@ impl Runtime {
     }
 
     fn convert_out<'js>(&self, py: Python<'_>, ctx: &Ctx<'js>, v: &Value<'js>) -> PyResult<Py<PyAny>> {
+        // lossy results turn Set/Map/Date into JSON-shaped values first; if the
+        // normalizer itself fails (interrupt), convert the raw value as before.
+        let normalized = if self.h.lossy && v.is_object() {
+            let f = ctx.userdata::<Plain>().map(|p| p.0.clone());
+            f.and_then(|f| f.call::<_, Value>((v.clone(),)).ok())
+        } else {
+            None
+        };
+        let v = normalized.as_ref().unwrap_or(v);
         to_py(py, v, 0, &Budget::new(self.h.max_value_bytes, self.h.lossy)).map_err(|e| {
             // A getter hitting the interrupt leaves a pending JS exception; clear it.
             let _ = ctx.catch();

@@ -72,3 +72,45 @@ def test_javascript_error_has_name_message_stack():
     with pytest.raises(JavaScriptError) as ei:
         rt.eval("throw 5")
     assert ei.value.name is None
+
+
+def test_lossy_normalizes_set_map_date():
+    rt = Runtime(lossy=True)
+    assert rt.eval("new Set([1, 2, 2])") == [1, 2]
+    assert rt.eval("new Set([undefined])") == [None]
+    assert rt.eval("new Map([['a', 1], [2, {b: new Set([3])}]])") == {"a": 1, "2": {"b": [3]}}
+    assert rt.eval("new Date(Date.UTC(2026, 0, 5, 10))") == "2026-01-05T10:00:00.000Z"
+    assert rt.eval("new Date(NaN)") is None
+    assert rt.eval("({when: new Date(0), tags: new Set(['x']), n: [new Map()]})") == {
+        "when": "1970-01-01T00:00:00.000Z",
+        "tags": ["x"],
+        "n": [{}],
+    }
+
+
+def test_lossy_normalizer_ignores_guest_tampering():
+    rt = Runtime(lossy=True)
+    rt.eval("var keep = new Set([1, 2]); var o = {a: 1}")
+    rt.eval("Object.keys = () => []; Array.isArray = () => false; Set = null")
+    assert rt.eval("keep") == [1, 2]
+    assert rt.eval("o") == {"a": 1}
+
+
+def test_lossy_normalizer_handles_cycles_and_class_instances():
+    rt = Runtime(lossy=True)
+    out = rt.eval("const s = new Set(); s.add(s); s")
+    assert isinstance(out, list) and len(out) == 1  # the cycle is cut, not followed forever
+    assert rt.eval("class P { constructor() { this.x = 1 } }; new P()") == {"x": 1}
+    assert rt.eval("new Uint8Array([1, 2])") == b"\x01\x02"
+
+
+def test_lossy_normalizer_is_bounded_by_the_timeout():
+    from jsbox import JsTimeoutError
+
+    rt = Runtime(lossy=True)
+    with pytest.raises(JsTimeoutError):
+        rt.eval("({get a() { for (;;) {} }})", timeout=0.2)
+
+
+def test_non_lossy_leaves_set_alone():
+    assert Runtime().eval("new Set([1])") == {}

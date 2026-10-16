@@ -43,7 +43,7 @@ jobs:
         if: matrix.test != false
         shell: bash
         run: |
-          python -m pip install pytest hypothesis
+          python -m pip install pytest pytest-asyncio hypothesis
           python -m pip install --no-index --find-links dist jsbox
           python -m pytest tests -q
       - uses: actions/upload-artifact@v4

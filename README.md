@@ -109,11 +109,56 @@ print(rt.eval_module("app"))  # {'x': 43}
 Only modules you registered can be imported, by `import` or `import()`. There is no file or URL
 loading.
 
+### Async host functions
+
+Bound functions may be `async def`. Under `eval_async` they reach JS as Promises, run on your event
+loop, and can be in flight concurrently (`Promise.all`). `timeout=` covers the whole call,
+including time spent waiting on the host.
+
+```python
+import asyncio
+from jsbox import Runtime
+
+
+async def fetch(x):
+    await asyncio.sleep(0.01)
+    return x * 2
+
+
+async def main():
+    rt = Runtime()
+    rt.bind_function("fetch", fetch)
+    print(await rt.eval_async("Promise.all([1, 2, 3].map(x => fetch(x)))"))  # [2, 4, 6]
+
+
+asyncio.run(main())
+```
+
+A plain `eval()` that calls an async function raises `TypeError`: use `eval_async`.
+
+### `console` and unconvertible results
+
+```python
+rt = Runtime(on_console=lambda level, args: print(level, args), lossy=True)
+rt.eval("console.log('hi', [1, 2]); console.error('oops')")  # log ['hi', [1, 2]] / error ['oops']
+rt.eval("({ok: true, run() {}})")  # {'ok': True, 'run': '[function]'}
+```
+
+`console.*` is a no-op without `on_console`. With `lossy=True`, functions, symbols and cycles in a
+result become `"[function]"`, `"[symbol]"`, `"[Circular]"` instead of raising.
+
+### Vendored npm libraries
+
+Browser bundles such as `pptxgenjs`, `three`, `vega`, `d3`, `turf`, `dagre` and `bpmn-moddle`
+run unmodified: the host prepends the bundle (and a few byte-plumbing shims) as trusted source,
+the guest calls the library, and bytes come back as `bytes`. The test suite runs these exact files
+(`tests/test_onehub_compat.py`).
+
 ### Errors
 
 | Situation | Python exception |
 |---|---|
-| JS throws, or a syntax error | `JavaScriptError` (message and JS stack) |
+| JS throws, or a syntax error | `JavaScriptError` (`.name`, `.message`, `.stack`) |
 | `timeout=` exceeded | `JsTimeoutError` |
 | A bound Python function raises | **the original exception**, re-raised unchanged |
 | Value cannot be converted | `TypeError` / `ValueError` |
@@ -148,16 +193,17 @@ a process you can kill** (or reject patterns up front). A built-in hard kill is 
 
 ## Limitations
 
-- Host functions are synchronous; `async def` callables raise a clear `TypeError`.
-- No timers, `fetch`, `Date`/`Map`/`Set` conversion, or `console` routing yet.
-- Interpreter speed: roughly 10x slower than V8 on CPU-bound code (`fib(30)` ≈ 90 ms), and a
+- No timers (`setTimeout`), `fetch`, or `Date`/`Map`/`Set` conversion yet. Libraries that only
+  use timers to yield work with a microtask shim.
+- Interpreter speed: roughly 5-10x slower than V8 on CPU-bound code (`fib(30)` ≈ 90 ms; a 20-slide
+  pptxgenjs deck ≈ 0.5 s vs 0.1 s on V8), and a
   complete host call (JS to Python and back) costs ≈ 0.5 µs.
 - Python ints outside `i64` cannot be sent in.
 
 ## Development
 
 ```bash
-python -m venv .venv && .venv/bin/pip install maturin pytest hypothesis
+python -m venv .venv && .venv/bin/pip install maturin pytest pytest-asyncio hypothesis
 .venv/bin/maturin develop --release
 .venv/bin/pytest
 ```

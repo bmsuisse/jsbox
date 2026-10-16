@@ -7,7 +7,7 @@ use rquickjs::module::Declared;
 use rquickjs::prelude::Rest;
 use rquickjs::{
     context::EvalOptions, convert::Coerced, ArrayBuffer, Atom, CatchResultExt, CaughtError, Ctx,
-    Exception, Function, Module, Object, Persistent, Type, TypedArray, Value,
+    Exception, Function, Module, Object, Persistent, Promise, Type, TypedArray, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -28,16 +28,25 @@ const NODE_COST: usize = 16;
 
 type Modules = Rc<RefCell<HashMap<String, String>>>;
 
-/// Bounds how much data one conversion may copy across the boundary.
-struct Budget(Cell<usize>);
+/// Bounds how much data one conversion may copy across the boundary. With
+/// `lossy`, JS values that have no Python equivalent (functions, symbols,
+/// cycles) become a descriptive string instead of an error.
+struct Budget {
+    left: Cell<usize>,
+    lossy: bool,
+}
 
 impl Budget {
+    fn new(max: usize, lossy: bool) -> Self {
+        Self { left: Cell::new(max), lossy }
+    }
+
     fn take(&self, n: usize) -> PyResult<()> {
-        let left = self.0.get();
+        let left = self.left.get();
         if n > left {
             return Err(PyValueError::new_err("value exceeds max_value_bytes"));
         }
-        self.0.set(left - n);
+        self.left.set(left - n);
         Ok(())
     }
 }
@@ -131,6 +140,9 @@ fn to_js<'js>(ctx: &Ctx<'js>, v: &Bound<'_, PyAny>, depth: usize, b: &Budget) ->
 
 fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyResult<Py<PyAny>> {
     if depth > MAX_DEPTH {
+        if b.lossy {
+            return Ok("[Circular]".into_pyobject(py)?.into_any().unbind());
+        }
         return Err(PyValueError::new_err("value nested too deeply (cycle?)"));
     }
     b.take(NODE_COST)?;
@@ -189,7 +201,7 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
                     Some(s) => s.to_string().map_err(val_err)?,
                     None => kv_key.get::<Coerced<String>>().map_err(val_err)?.0,
                 };
-                if val.is_function() {
+                if val.is_function() && !b.lossy {
                     continue;
                 }
                 b.take(k.len())?;
@@ -197,6 +209,9 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
             }
             d.into_any().unbind()
         }
+        Type::Function | Type::Constructor if b.lossy => "[function]".into_pyobject(py)?.into_any().unbind(),
+        Type::Symbol if b.lossy => "[symbol]".into_pyobject(py)?.into_any().unbind(),
+        t if b.lossy => format!("[{t:?}]").into_pyobject(py)?.into_any().unbind(),
         t => return Err(PyTypeError::new_err(format!("cannot convert JS {t:?} to Python"))),
     })
 }
@@ -216,62 +231,158 @@ fn clear_stash<'js>(ctx: &Ctx<'js>, host_err: &HostErr) {
     }
 }
 
-fn host_function<'js>(
-    ctx: &Ctx<'js>,
-    func: Py<PyAny>,
+/// The JS error handed to the guest for a failed host function. The guest only
+/// learns the exception class, never its message.
+fn host_failure<'js>(ctx: &Ctx<'js>, host_err: &HostErr, py: Python<'_>, e: PyErr) -> rquickjs::Result<Value<'js>> {
+    let name = e.get_type(py).name().map(|n| n.to_string()).unwrap_or_default();
+    let ex = Exception::from_message(ctx.clone(), &format!("host function failed: {name}"))?;
+    let val = ex.into_value();
+    clear_stash(ctx, host_err);
+    *host_err.borrow_mut() = Some((Persistent::save(ctx, val.clone()), e));
+    Ok(val)
+}
+
+/// A pending awaitable started by an async host function. The persistents are
+/// restored in `Asy::release`; never just dropped (see `clear_stash`).
+struct Pending {
+    id: u64,
+    task: Py<PyAny>,
+    resolve: Persistent<Function<'static>>,
+    reject: Persistent<Function<'static>>,
+}
+
+/// State of one `eval_async` run, driven step by step from Python.
+#[derive(Default)]
+struct Asy {
+    active: Cell<bool>,
+    next: Cell<u64>,
+    pending: RefCell<Vec<Pending>>,
+    main: RefCell<Option<Persistent<Value<'static>>>>,
+}
+
+impl Asy {
+    fn release<'js>(&self, py: Python<'_>, ctx: &Ctx<'js>) {
+        self.active.set(false);
+        for p in self.pending.take() {
+            let _ = p.task.call_method0(py, "cancel");
+            let _ = p.resolve.restore(ctx);
+            let _ = p.reject.restore(ctx);
+        }
+        if let Some(m) = self.main.take() {
+            let _ = m.restore(ctx);
+        }
+    }
+}
+
+struct HostCtx {
     host_err: HostErr,
+    asy: Rc<Asy>,
     max_value_bytes: usize,
-) -> rquickjs::Result<Function<'js>> {
+    lossy: bool,
+}
+
+fn host_function<'js>(ctx: &Ctx<'js>, func: Py<PyAny>, h: Rc<HostCtx>) -> rquickjs::Result<Function<'js>> {
     Function::new(ctx.clone(), move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<Value<'js>> {
         Python::attach(|py| {
-            let budget = Budget(Cell::new(max_value_bytes));
             let call = || -> PyResult<Value<'js>> {
                 let a = args
                     .0
                     .iter()
-                    .map(|v| to_py(py, v, 0, &budget))
+                    .map(|v| to_py(py, v, 0, &Budget::new(h.max_value_bytes, h.lossy)))
                     .collect::<PyResult<Vec<_>>>()?;
                 let r = func.call1(py, PyTuple::new(py, a)?)?;
-                if r.bind(py).hasattr("__await__")? {
-                    return Err(PyTypeError::new_err("async host functions are not supported yet"));
-                }
-                to_js(&ctx, r.bind(py), 0, &Budget(Cell::new(max_value_bytes)))
-            };
-            call().map_err(|e| {
-                // The guest only learns the exception class, never its message.
-                let name = e.get_type(py).name().map(|n| n.to_string()).unwrap_or_default();
-                let msg = format!("host function failed: {name}");
-                match Exception::from_message(ctx.clone(), &msg) {
-                    Ok(ex) => {
-                        let val = ex.into_value();
-                        clear_stash(&ctx, &host_err);
-                        *host_err.borrow_mut() = Some((Persistent::save(&ctx, val.clone()), e));
-                        ctx.throw(val)
+                let r = r.bind(py);
+                if r.hasattr("__await__")? {
+                    if !h.asy.active.get() {
+                        let _ = r.call_method0("close");
+                        return Err(PyTypeError::new_err("async host functions need eval_async"));
                     }
-                    Err(err) => err,
+                    let task = py.import("asyncio")?.call_method1("ensure_future", (r,))?;
+                    let (promise, resolve, reject) = Promise::new(&ctx).map_err(val_err)?;
+                    let id = h.asy.next.get() + 1;
+                    h.asy.next.set(id);
+                    h.asy.pending.borrow_mut().push(Pending {
+                        id,
+                        task: task.unbind(),
+                        resolve: Persistent::save(&ctx, resolve),
+                        reject: Persistent::save(&ctx, reject),
+                    });
+                    return Ok(promise.into_value());
                 }
-            })
+                to_js(&ctx, r, 0, &Budget::new(h.max_value_bytes, false))
+            };
+            match call() {
+                Ok(v) => Ok(v),
+                Err(e) => host_failure(&ctx, &h.host_err, py, e).and_then(|v| Err(ctx.throw(v))),
+            }
         })
     })
 }
 
-#[pyclass(unsendable)]
+const CONSOLE_LEVELS: [&str; 8] = ["log", "info", "debug", "dir", "table", "warn", "error", "trace"];
+
+fn install_console<'js>(ctx: &Ctx<'js>, cb: Option<Py<PyAny>>, max: usize) -> rquickjs::Result<()> {
+    let console = Object::new(ctx.clone())?;
+    for level in CONSOLE_LEVELS {
+        let cb = cb.as_ref().map(|c| Python::attach(|py| c.clone_ref(py)));
+        let f = Function::new(ctx.clone(), move |args: Rest<Value<'js>>| -> rquickjs::Result<()> {
+            if let Some(cb) = &cb {
+                Python::attach(|py| {
+                    let a: Vec<Py<PyAny>> = args
+                        .0
+                        .iter()
+                        .map(|v| {
+                            to_py(py, v, 0, &Budget::new(max, true))
+                                .unwrap_or_else(|_| "[unprintable]".into_pyobject(py).unwrap().into_any().unbind())
+                        })
+                        .collect();
+                    if let Ok(list) = PyList::new(py, a) {
+                        // A failing console callback must not become a guest-visible error.
+                        let _ = cb.call1(py, (level, list));
+                    }
+                });
+            }
+            Ok(())
+        })?;
+        console.set(level, f)?;
+    }
+    ctx.globals().set("console", console)
+}
+
+fn parse_timeout(timeout: Option<f64>) -> PyResult<Option<Instant>> {
+    match timeout {
+        None => Ok(None),
+        Some(t) if t.is_finite() && t >= 0.0 => Ok(Some(Instant::now() + Duration::from_secs_f64(t.min(1e9)))),
+        Some(_) => Err(PyValueError::new_err("timeout must be a finite number >= 0")),
+    }
+}
+
+#[pyclass(unsendable, subclass)]
 struct Runtime {
     ctx: rquickjs::Context,
     deadline: Rc<Cell<Option<Instant>>>,
+    total: Cell<Option<Instant>>,
     timed_out: Rc<Cell<bool>>,
-    host_err: HostErr,
+    h: Rc<HostCtx>,
     modules: Modules,
-    max_value_bytes: usize,
 }
 
 #[pymethods]
 impl Runtime {
     /// `memory_limit`, `max_stack_size` and `max_value_bytes` have safe
     /// defaults; pass 0 to `memory_limit`/`max_stack_size` to disable.
+    /// `on_console(level, args)` receives `console.*` calls; `lossy=True`
+    /// turns unconvertible JS results (functions, symbols, cycles) into
+    /// placeholder strings instead of raising.
     #[new]
-    #[pyo3(signature = (memory_limit=DEFAULT_MEMORY, max_stack_size=DEFAULT_STACK, max_value_bytes=DEFAULT_VALUE_BYTES))]
-    fn new(memory_limit: usize, max_stack_size: usize, max_value_bytes: usize) -> PyResult<Self> {
+    #[pyo3(signature = (memory_limit=DEFAULT_MEMORY, max_stack_size=DEFAULT_STACK, max_value_bytes=DEFAULT_VALUE_BYTES, on_console=None, lossy=false))]
+    fn new(
+        memory_limit: usize,
+        max_stack_size: usize,
+        max_value_bytes: usize,
+        on_console: Option<Py<PyAny>>,
+        lossy: bool,
+    ) -> PyResult<Self> {
         let rt = rquickjs::Runtime::new().map_err(val_err)?;
         rt.set_memory_limit(memory_limit);
         rt.set_max_stack_size(max_stack_size);
@@ -288,25 +399,26 @@ impl Runtime {
         let modules: Modules = Rc::default();
         rt.set_loader(StaticResolver(modules.clone()), StaticLoader(modules.clone()));
         let ctx = rquickjs::Context::full(&rt).map_err(val_err)?;
+        ctx.with(|ctx| install_console(&ctx, on_console, max_value_bytes)).map_err(val_err)?;
         Ok(Self {
             ctx,
             deadline,
+            total: Cell::new(None),
             timed_out,
-            host_err: Rc::default(),
+            h: Rc::new(HostCtx {
+                host_err: Rc::default(),
+                asy: Rc::default(),
+                max_value_bytes,
+                lossy,
+            }),
             modules,
-            max_value_bytes,
         })
     }
 
     /// Evaluate a script; a returned promise is settled by draining microtasks.
     #[pyo3(signature = (code, timeout=None))]
     fn eval(&self, py: Python<'_>, code: &str, timeout: Option<f64>) -> PyResult<Py<PyAny>> {
-        self.run(py, timeout, |ctx| {
-            // Scripts run sloppy like a browser/V8 script; rquickjs defaults to strict.
-            let mut o = EvalOptions::default();
-            o.strict = false;
-            ctx.eval_with_options::<Value, _>(code, o).catch(ctx)
-        })
+        self.run(py, timeout, |ctx| Self::eval_script(ctx, code))
     }
 
     /// Evaluate a module registered with `add_static_module`; returns its
@@ -328,11 +440,11 @@ impl Runtime {
         self.modules.borrow_mut().insert(name.to_string(), source.to_string());
     }
 
-    /// Expose a Python callable as a JS global. Sync callables only.
+    /// Expose a Python callable as a JS global. A callable that returns an
+    /// awaitable gives JS a Promise and needs `eval_async`.
     fn bind_function(&self, name: &str, func: Py<PyAny>) -> PyResult<()> {
         self.ctx.with(|ctx| -> PyResult<()> {
-            let f = host_function(&ctx, func, self.host_err.clone(), self.max_value_bytes)
-                .map_err(val_err)?;
+            let f = host_function(&ctx, func, self.h.clone()).map_err(val_err)?;
             ctx.globals().set(name, f).map_err(val_err)
         })
     }
@@ -340,36 +452,136 @@ impl Runtime {
     /// Copy a Python value (dict/list/str/number/bytes/None) into a JS global.
     fn bind_object(&self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         self.ctx.with(|ctx| {
-            let v = to_js(&ctx, value, 0, &Budget(Cell::new(self.max_value_bytes)))?;
+            let v = to_js(&ctx, value, 0, &Budget::new(self.h.max_value_bytes, false))?;
             ctx.globals().set(name, v).map_err(val_err)
         })
+    }
+
+    // --- stepwise driver for `eval_async` (see python/jsbox/__init__.py) ---
+
+    fn _begin_async(&self, py: Python<'_>, code: &str, timeout: Option<f64>) -> PyResult<()> {
+        let dl = parse_timeout(timeout)?;
+        self.timed_out.set(false);
+        self.total.set(dl);
+        self.deadline.set(dl);
+        self.h.asy.active.set(true);
+        let out = self.ctx.with(|ctx| -> PyResult<()> {
+            clear_stash(&ctx, &self.h.host_err);
+            let v = Self::eval_script(&ctx, code).map_err(|e| self.map_err(&ctx, e))?;
+            *self.h.asy.main.borrow_mut() = Some(Persistent::save(&ctx, v));
+            Ok(())
+        });
+        self.deadline.set(None);
+        let _ = py;
+        out
+    }
+
+    /// Returns `(True, result)` when the script's promise settled, else
+    /// `(False, [(id, task), ...])` for the host to await.
+    fn _poll(&self, py: Python<'_>) -> PyResult<(bool, Py<PyAny>)> {
+        self.deadline.set(self.total.get());
+        let out = self.ctx.with(|ctx| -> PyResult<(bool, Py<PyAny>)> {
+            while !self.timed_out.get() && ctx.execute_pending_job() {}
+            let Some(main) = self.h.asy.main.borrow_mut().take() else {
+                return Err(JavaScriptError::new_err("eval_async was not started"));
+            };
+            let v = main.restore(&ctx).map_err(val_err)?;
+            let Some(p) = v.clone().into_promise() else {
+                return self.convert_out(py, &ctx, &v).map(|r| (true, r));
+            };
+            match p.result::<Value>() {
+                Some(r) => {
+                    let v = r.catch(&ctx).map_err(|e| self.map_err(&ctx, e))?;
+                    self.convert_out(py, &ctx, &v).map(|r| (true, r))
+                }
+                None => {
+                    if self.timed_out.get() {
+                        return Err(JsTimeoutError::new_err("script exceeded its timeout"));
+                    }
+                    let pending = self.h.asy.pending.borrow();
+                    if pending.is_empty() {
+                        return Err(JavaScriptError::new_err("promise never settled (no pending jobs)"));
+                    }
+                    let list = PyList::empty(py);
+                    for p in pending.iter() {
+                        list.append((p.id, p.task.clone_ref(py)))?;
+                    }
+                    drop(pending);
+                    *self.h.asy.main.borrow_mut() = Some(Persistent::save(&ctx, v));
+                    Ok((false, list.into_any().unbind()))
+                }
+            }
+        });
+        self.deadline.set(None);
+        out
+    }
+
+    /// Resolve (`ok`) or reject the JS promise of host call `id`.
+    fn _settle(&self, py: Python<'_>, id: u64, ok: bool, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let taken = {
+            let mut pending = self.h.asy.pending.borrow_mut();
+            pending.iter().position(|p| p.id == id).map(|i| pending.remove(i))
+        };
+        let Some(p) = taken else { return Ok(()) };
+        self.deadline.set(self.total.get());
+        let out = self.ctx.with(|ctx| -> PyResult<()> {
+            let resolve = p.resolve.restore(&ctx).map_err(val_err)?;
+            let reject = p.reject.restore(&ctx).map_err(val_err)?;
+            let outcome: Result<Value<'_>, PyErr> = if ok {
+                to_js(&ctx, value, 0, &Budget::new(self.h.max_value_bytes, false))
+            } else {
+                Err(PyErr::from_value(value.clone()))
+            };
+            match outcome {
+                Ok(v) => resolve.call::<_, ()>((v,)).map_err(val_err),
+                Err(e) => {
+                    let err = host_failure(&ctx, &self.h.host_err, py, e).map_err(val_err)?;
+                    reject.call::<_, ()>((err,)).map_err(val_err)
+                }
+            }
+        });
+        self.deadline.set(None);
+        out
+    }
+
+    fn _end_async(&self, py: Python<'_>) {
+        self.ctx.with(|ctx| {
+            self.h.asy.release(py, &ctx);
+            clear_stash(&ctx, &self.h.host_err);
+        });
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        Python::attach(|_| self.ctx.with(|ctx| clear_stash(&ctx, &self.host_err)));
+        Python::attach(|py| self.ctx.with(|ctx| {
+            self.h.asy.release(py, &ctx);
+            clear_stash(&ctx, &self.h.host_err);
+        }));
     }
 }
 
 impl Runtime {
+    /// Scripts run sloppy like a browser/V8 script; rquickjs defaults to strict.
+    fn eval_script<'js>(ctx: &Ctx<'js>, code: &str) -> Result<Value<'js>, CaughtError<'js>> {
+        let mut o = EvalOptions::default();
+        o.strict = false;
+        ctx.eval_with_options::<Value, _>(code, o).catch(ctx)
+    }
+
     fn run<'a>(
         &self,
         py: Python<'a>,
         timeout: Option<f64>,
         f: impl for<'js> FnOnce(&Ctx<'js>) -> Result<Value<'js>, CaughtError<'js>>,
     ) -> PyResult<Py<PyAny>> {
-        let deadline = match timeout {
-            None => None,
-            Some(t) if t.is_finite() && t >= 0.0 => Some(Instant::now() + Duration::from_secs_f64(t.min(1e9))),
-            Some(_) => return Err(PyValueError::new_err("timeout must be a finite number >= 0")),
-        };
+        let deadline = parse_timeout(timeout)?;
         self.timed_out.set(false);
         self.deadline.set(deadline);
         let out = self.ctx.with(|ctx| {
-            clear_stash(&ctx, &self.host_err);
+            clear_stash(&ctx, &self.h.host_err);
             let r = self.run_in(py, &ctx, f);
-            clear_stash(&ctx, &self.host_err);
+            clear_stash(&ctx, &self.h.host_err);
             r
         });
         self.deadline.set(None);
@@ -382,18 +594,20 @@ impl Runtime {
         ctx: &Ctx<'js>,
         f: impl FnOnce(&Ctx<'js>) -> Result<Value<'js>, CaughtError<'js>>,
     ) -> PyResult<Py<PyAny>> {
-        {
-            let v = f(&ctx).and_then(|v| self.settle(&ctx, v)).map_err(|e| self.map_err(&ctx, e))?;
-            to_py(py, &v, 0, &Budget(Cell::new(self.max_value_bytes))).map_err(|e| {
-                // A getter hitting the interrupt leaves a pending JS exception; clear it.
-                let _ = ctx.catch();
-                if self.timed_out.get() {
-                    JsTimeoutError::new_err("script exceeded its timeout")
-                } else {
-                    e
-                }
-            })
-        }
+        let v = f(ctx).and_then(|v| self.settle(ctx, v)).map_err(|e| self.map_err(ctx, e))?;
+        self.convert_out(py, ctx, &v)
+    }
+
+    fn convert_out<'js>(&self, py: Python<'_>, ctx: &Ctx<'js>, v: &Value<'js>) -> PyResult<Py<PyAny>> {
+        to_py(py, v, 0, &Budget::new(self.h.max_value_bytes, self.h.lossy)).map_err(|e| {
+            // A getter hitting the interrupt leaves a pending JS exception; clear it.
+            let _ = ctx.catch();
+            if self.timed_out.get() {
+                JsTimeoutError::new_err("script exceeded its timeout")
+            } else {
+                e
+            }
+        })
     }
 
     /// Drain microtasks until a returned promise settles.
@@ -414,6 +628,7 @@ impl Runtime {
             return JsTimeoutError::new_err("script exceeded its timeout");
         }
         let stashed = self
+            .h
             .host_err
             .borrow_mut()
             .take()
@@ -428,16 +643,27 @@ impl Runtime {
                 return pe;
             }
         }
-        JavaScriptError::new_err(match &e {
-            CaughtError::Exception(x) => {
-                format!("{}\n{}", x.message().unwrap_or_default(), x.stack().unwrap_or_default())
-            }
-            CaughtError::Value(v) => format!("{v:?}"),
+        let (name, message, stack) = match &e {
+            CaughtError::Exception(x) => (
+                x.as_object().get::<_, Option<String>>("name").ok().flatten(),
+                x.message().unwrap_or_default(),
+                x.stack().unwrap_or_default(),
+            ),
+            CaughtError::Value(v) => (None, format!("{v:?}"), String::new()),
             CaughtError::Error(rquickjs::Error::Unknown) => {
-                "promise never settled (no pending jobs)".to_string()
+                (None, "promise never settled (no pending jobs)".to_string(), String::new())
             }
-            CaughtError::Error(e) => e.to_string(),
-        })
+            CaughtError::Error(e) => (None, e.to_string(), String::new()),
+        };
+        let text = if stack.is_empty() { message.clone() } else { format!("{message}\n{stack}") };
+        let err = JavaScriptError::new_err(text);
+        Python::attach(|py| {
+            let v = err.value(py);
+            let _ = v.setattr("name", name);
+            let _ = v.setattr("message", message);
+            let _ = v.setattr("stack", stack);
+        });
+        err
     }
 }
 

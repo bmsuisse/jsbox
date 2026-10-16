@@ -198,3 +198,34 @@ async def main():
 asyncio.run(main())
 """
     )
+
+
+async def test_pending_host_calls_are_bounded():
+    rt = Runtime(max_pending_calls=8)
+    started = []
+
+    async def hang():
+        started.append(1)
+        await asyncio.sleep(30)
+
+    rt.bind_function("hang", hang)
+    with pytest.raises(RuntimeError, match="too many pending"):
+        await rt.eval_async("(async () => { for (;;) { hang() } })()", timeout=5)
+    assert len(started) <= 8
+
+
+async def test_failed_begin_leaves_the_runtime_clean():
+    rt = Runtime()
+
+    async def f():
+        return 1
+
+    rt.bind_function("f", f)
+    with pytest.raises(JavaScriptError):
+        await rt.eval_async("let x = ;")
+    with pytest.raises(ValueError):
+        await rt.eval_async("1", timeout=float("nan"))
+    # async mode is off again: a sync eval must reject, not leak a task
+    with pytest.raises(TypeError, match="eval_async"):
+        rt.eval("f()")
+    assert await rt.eval_async("(async () => (await f()) + 1)()") == 2

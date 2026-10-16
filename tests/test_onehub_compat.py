@@ -231,3 +231,31 @@ async def test_many_parallel_tool_calls_like_a_batch_script():
         timeout=30,
     )
     assert out == list(range(32))
+
+
+# pdf-lib is not vendored by OneHub: point JSBOX_PDFLIB at pdf-lib@1.17.1's dist/pdf-lib.min.js.
+PDFLIB = Path(os.environ["JSBOX_PDFLIB"]) if "JSBOX_PDFLIB" in os.environ else None
+
+
+@pytest.mark.skipif(PDFLIB is None or not PDFLIB.is_file(), reason="JSBOX_PDFLIB not set")
+def test_pdf_lib_builds_a_valid_multipage_pdf():
+    code = """(async () => {
+      const { PDFDocument, StandardFonts, rgb } = PDFLib;
+      const doc = await PDFDocument.create();
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      for (let i = 1; i <= 3; i++) {
+        const page = doc.addPage([400, 300]);
+        page.drawText(`Page ${i} built with pdf-lib in jsbox`, { x: 20, y: 150, size: 14, font, color: rgb(0.1, 0.2, 0.4) });
+        page.drawRectangle({ x: 20, y: 100, width: 100, height: 20, color: rgb(0.9, 0.1, 0.1) });
+      }
+      doc.setTitle('jsbox');
+      return await doc.save();
+    })()"""
+    out = runtime().eval(PDFLIB.read_text() + "\n;\n" + code, timeout=60)
+    assert out[:5] == b"%PDF-" and out.rstrip().endswith(b"%%EOF")
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return
+    reader = PdfReader(io.BytesIO(out))
+    assert len(reader.pages) == 3 and "Page 2" in reader.pages[1].extract_text()

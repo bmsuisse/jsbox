@@ -193,11 +193,13 @@ a process you can kill** (or reject patterns up front). A built-in hard kill is 
 
 ## Limitations
 
+- `TextEncoder`/`TextDecoder` (UTF-8) and `btoa`/`atob` are built in and native.
 - No timers (`setTimeout`), `fetch`, or `Date`/`Map`/`Set` conversion yet. Libraries that only
   use timers to yield work with a microtask shim.
-- Interpreter speed: roughly 5-10x slower than V8 on CPU-bound code (`fib(30)` ≈ 90 ms; a 20-slide
-  pptxgenjs deck ≈ 0.5 s vs 0.1 s on V8), and a
-  complete host call (JS to Python and back) costs ≈ 0.5 µs.
+- Interpreter speed: it is not a JIT. CPU-bound JavaScript runs roughly 4-8x slower than V8 (a
+  20-slide pptxgenjs deck ≈ 0.45 s vs 0.1 s; `fib(30)` ≈ 70 ms vs 10 ms). Startup and boundary
+  crossings are where it wins: creating a runtime ≈ 0.2 ms, a complete host call (JS to Python and
+  back) ≈ 0.5 µs, `eval('1+1')` ≈ 2 µs.
 - Python ints outside `i64` cannot be sent in.
 
 ## Development

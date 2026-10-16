@@ -1,8 +1,9 @@
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use rquickjs::loader::{Loader, Resolver};
+use rquickjs::loader::{ImportAttributes, Loader, Resolver};
+
 use rquickjs::module::Declared;
 use rquickjs::prelude::Rest;
 use rquickjs::{
@@ -22,6 +23,7 @@ const MAX_SAFE: f64 = 9007199254740992.0;
 const DEFAULT_MEMORY: usize = 64 * 1024 * 1024;
 const DEFAULT_STACK: usize = 1024 * 1024;
 const DEFAULT_VALUE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_PENDING: usize = 64;
 /// Each converted node costs at least this much, so huge arrays of tiny
 /// values are bounded too, not just big strings.
 const NODE_COST: usize = 16;
@@ -55,7 +57,13 @@ struct StaticResolver(Modules);
 struct StaticLoader(Modules);
 
 impl Resolver for StaticResolver {
-    fn resolve<'js>(&mut self, ctx: &Ctx<'js>, _base: &str, name: &str) -> rquickjs::Result<String> {
+    fn resolve<'js>(
+        &mut self,
+        ctx: &Ctx<'js>,
+        _base: &str,
+        name: &str,
+        _attributes: Option<ImportAttributes<'js>>,
+    ) -> rquickjs::Result<String> {
         if self.0.borrow().contains_key(name) {
             Ok(name.to_string())
         } else {
@@ -65,7 +73,12 @@ impl Resolver for StaticResolver {
 }
 
 impl Loader for StaticLoader {
-    fn load<'js>(&mut self, ctx: &Ctx<'js>, name: &str) -> rquickjs::Result<Module<'js, Declared>> {
+    fn load<'js>(
+        &mut self,
+        ctx: &Ctx<'js>,
+        name: &str,
+        _attributes: Option<ImportAttributes<'js>>,
+    ) -> rquickjs::Result<Module<'js, Declared>> {
         let src = self.0.borrow().get(name).cloned();
         match src {
             Some(s) => Module::declare(ctx.clone(), name, s),
@@ -183,10 +196,10 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
             let obj = v.as_object().unwrap();
             let bytes = TypedArray::<u8>::from_object(obj.clone())
                 .ok()
-                .and_then(|t| t.as_bytes().map(<[u8]>::to_vec))
+                .and_then(|t| unsafe { t.as_bytes() }.map(<[u8]>::to_vec)) // copied at once, no JS runs in between
                 .or_else(|| {
                     ArrayBuffer::from_object(obj.clone())
-                        .and_then(|a| a.as_bytes().map(<[u8]>::to_vec))
+                        .and_then(|a| unsafe { a.as_bytes() }.map(<[u8]>::to_vec))
                 });
             if let Some(bytes) = bytes {
                 b.take(bytes.len())?;
@@ -278,6 +291,7 @@ struct HostCtx {
     host_err: HostErr,
     asy: Rc<Asy>,
     max_value_bytes: usize,
+    max_pending: usize,
     lossy: bool,
 }
 
@@ -296,6 +310,10 @@ fn host_function<'js>(ctx: &Ctx<'js>, func: Py<PyAny>, h: Rc<HostCtx>) -> rquick
                     if !h.asy.active.get() {
                         let _ = r.call_method0("close");
                         return Err(PyTypeError::new_err("async host functions need eval_async"));
+                    }
+                    if h.asy.pending.borrow().len() >= h.max_pending {
+                        let _ = r.call_method0("close");
+                        return Err(PyRuntimeError::new_err("too many pending host calls"));
                     }
                     let task = py.import("asyncio")?.call_method1("ensure_future", (r,))?;
                     let (promise, resolve, reject) = Promise::new(&ctx).map_err(val_err)?;
@@ -317,6 +335,60 @@ fn host_function<'js>(ctx: &Ctx<'js>, func: Py<PyAny>, h: Rc<HostCtx>) -> rquick
             }
         })
     })
+}
+
+/// Native TextEncoder/TextDecoder/btoa/atob: libraries (JSZip, pptxgenjs, vega)
+/// lean on them, and the pure-JS shims are the slowest part of a QuickJS run.
+const WEB_BYTES_JS: &str = r#"(function (enc, dec, b2a, a2b) {
+  class TextEncoder { get encoding() { return 'utf-8'; } encode(s = '') { return enc(String(s)); } }
+  class TextDecoder {
+    constructor(label = 'utf-8') {
+      const l = String(label).toLowerCase();
+      if (l !== 'utf-8' && l !== 'utf8') throw new RangeError('only utf-8 is supported');
+    }
+    get encoding() { return 'utf-8'; }
+    decode(input) {
+      if (input === undefined) return '';
+      const b = ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : new Uint8Array(input);
+      return dec(b);
+    }
+  }
+  const def = (k, v) => Object.defineProperty(globalThis, k, { value: v, writable: true, configurable: true, enumerable: false });
+  def('TextEncoder', TextEncoder); def('TextDecoder', TextDecoder);
+  def('btoa', (s) => b2a(String(s))); def('atob', (s) => a2b(String(s)));
+})"#;
+
+fn install_web_bytes<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<()> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let enc = Function::new(ctx.clone(), |ctx: Ctx<'js>, s: rquickjs::String<'js>| -> rquickjs::Result<TypedArray<'js, u8>> {
+        TypedArray::new(ctx, s.to_string()?.into_bytes())
+    })?;
+    let dec = Function::new(ctx.clone(), |ctx: Ctx<'js>, b: TypedArray<'js, u8>| -> rquickjs::Result<rquickjs::String<'js>> {
+        let bytes = unsafe { b.as_bytes() }.unwrap_or_default();
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+        rquickjs::String::from_str(ctx, &String::from_utf8_lossy(bytes))
+    })?;
+    let b2a = Function::new(ctx.clone(), |ctx: Ctx<'js>, s: rquickjs::String<'js>| -> rquickjs::Result<String> {
+        let mut raw = Vec::new();
+        for c in s.to_string()?.chars() {
+            match u8::try_from(u32::from(c)) {
+                Ok(b) => raw.push(b),
+                Err(_) => return Err(Exception::throw_message(&ctx, "InvalidCharacterError: string contains characters outside Latin1")),
+            }
+        }
+        Ok(STANDARD.encode(raw))
+    })?;
+    let a2b = Function::new(ctx.clone(), |ctx: Ctx<'js>, s: rquickjs::String<'js>| -> rquickjs::Result<rquickjs::String<'js>> {
+        let clean: String = s.to_string()?.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let clean = clean.trim_end_matches('=');
+        let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(clean)
+            .map_err(|_| Exception::throw_message(&ctx, "InvalidCharacterError: invalid base64"))?;
+        let latin1: String = raw.iter().map(|&b| char::from(b)).collect();
+        rquickjs::String::from_str(ctx, &latin1)
+    })?;
+    let install: Function = ctx.eval(WEB_BYTES_JS)?;
+    install.call::<_, ()>((enc, dec, b2a, a2b))
 }
 
 const CONSOLE_LEVELS: [&str; 8] = ["log", "info", "debug", "dir", "table", "warn", "error", "trace"];
@@ -373,15 +445,17 @@ impl Runtime {
     /// defaults; pass 0 to `memory_limit`/`max_stack_size` to disable.
     /// `on_console(level, args)` receives `console.*` calls; `lossy=True`
     /// turns unconvertible JS results (functions, symbols, cycles) into
-    /// placeholder strings instead of raising.
+    /// placeholder strings instead of raising. `max_pending_calls` bounds the
+    /// async host calls in flight at once.
     #[new]
-    #[pyo3(signature = (memory_limit=DEFAULT_MEMORY, max_stack_size=DEFAULT_STACK, max_value_bytes=DEFAULT_VALUE_BYTES, on_console=None, lossy=false))]
+    #[pyo3(signature = (memory_limit=DEFAULT_MEMORY, max_stack_size=DEFAULT_STACK, max_value_bytes=DEFAULT_VALUE_BYTES, on_console=None, lossy=false, max_pending_calls=DEFAULT_MAX_PENDING))]
     fn new(
         memory_limit: usize,
         max_stack_size: usize,
         max_value_bytes: usize,
         on_console: Option<Py<PyAny>>,
         lossy: bool,
+        max_pending_calls: usize,
     ) -> PyResult<Self> {
         let rt = rquickjs::Runtime::new().map_err(val_err)?;
         rt.set_memory_limit(memory_limit);
@@ -399,7 +473,7 @@ impl Runtime {
         let modules: Modules = Rc::default();
         rt.set_loader(StaticResolver(modules.clone()), StaticLoader(modules.clone()));
         let ctx = rquickjs::Context::full(&rt).map_err(val_err)?;
-        ctx.with(|ctx| install_console(&ctx, on_console, max_value_bytes)).map_err(val_err)?;
+        ctx.with(|ctx| install_console(&ctx, on_console, max_value_bytes).and_then(|()| install_web_bytes(&ctx))).map_err(val_err)?;
         Ok(Self {
             ctx,
             deadline,
@@ -409,6 +483,7 @@ impl Runtime {
                 host_err: Rc::default(),
                 asy: Rc::default(),
                 max_value_bytes,
+                max_pending: max_pending_calls,
                 lossy,
             }),
             modules,

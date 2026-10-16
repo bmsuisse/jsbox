@@ -580,7 +580,7 @@ impl Runtime {
                     .and_then(|f| f.construct::<_, Value>((code,)))
                     .map(|_| ())
             };
-            r.catch(&ctx).map_err(|e| self.map_err(&ctx, e))
+            r.catch(&ctx).map_err(|e| plain_js_error(&e))
         })
     }
 
@@ -800,28 +800,33 @@ impl Runtime {
                 return pe;
             }
         }
-        let (name, message, stack) = match &e {
-            CaughtError::Exception(x) => (
-                x.as_object().get::<_, Option<String>>("name").ok().flatten(),
-                x.message().unwrap_or_default(),
-                x.stack().unwrap_or_default(),
-            ),
-            CaughtError::Value(v) => (None, format!("{v:?}"), String::new()),
-            CaughtError::Error(rquickjs::Error::Unknown) => {
-                (None, "promise never settled (no pending jobs)".to_string(), String::new())
-            }
-            CaughtError::Error(e) => (None, e.to_string(), String::new()),
-        };
-        let text = if stack.is_empty() { message.clone() } else { format!("{message}\n{stack}") };
-        let err = JavaScriptError::new_err(text);
-        Python::attach(|py| {
-            let v = err.value(py);
-            let _ = v.setattr("name", name);
-            let _ = v.setattr("message", message);
-            let _ = v.setattr("stack", stack);
-        });
-        err
+        plain_js_error(&e)
     }
+}
+
+/// Convert a caught JS error to `JavaScriptError` without touching any runtime state.
+fn plain_js_error(e: &CaughtError<'_>) -> PyErr {
+    let (name, message, stack) = match e {
+        CaughtError::Exception(x) => (
+            x.as_object().get::<_, Option<String>>("name").ok().flatten(),
+            x.message().unwrap_or_default(),
+            x.stack().unwrap_or_default(),
+        ),
+        CaughtError::Value(v) => (None, format!("{v:?}"), String::new()),
+        CaughtError::Error(rquickjs::Error::Unknown) => {
+            (None, "promise never settled (no pending jobs)".to_string(), String::new())
+        }
+        CaughtError::Error(e) => (None, e.to_string(), String::new()),
+    };
+    let text = if stack.is_empty() { message.clone() } else { format!("{message}\n{stack}") };
+    let err = JavaScriptError::new_err(text);
+    Python::attach(|py| {
+        let v = err.value(py);
+        let _ = v.setattr("name", name);
+        let _ = v.setattr("message", message);
+        let _ = v.setattr("stack", stack);
+    });
+    err
 }
 
 #[pymodule]

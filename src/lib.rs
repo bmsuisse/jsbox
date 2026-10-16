@@ -563,18 +563,25 @@ impl Runtime {
 
     /// Parse `code` without running it; raises `JavaScriptError` (SyntaxError) if invalid.
     /// Scripts are checked as a function body, so top-level `return` is accepted.
+    /// Uses a throwaway pristine context, so guest state (e.g. a replaced
+    /// `Function`) can never influence or run during the check.
     #[pyo3(signature = (code, module=false))]
-    fn check_syntax(&self, py: Python<'_>, code: &str, module: bool) -> PyResult<()> {
-        self.run(py, None, |ctx| {
-            if module {
-                Module::declare(ctx.clone(), "check", code).catch(ctx)?;
+    fn check_syntax(&self, code: &str, module: bool) -> PyResult<()> {
+        let rt = rquickjs::Runtime::new().map_err(val_err)?;
+        rt.set_memory_limit(DEFAULT_MEMORY);
+        rt.set_max_stack_size(DEFAULT_STACK);
+        let ctx = rquickjs::Context::full(&rt).map_err(val_err)?;
+        ctx.with(|ctx| -> PyResult<()> {
+            let r = if module {
+                Module::declare(ctx.clone(), "check", code).map(|_| ())
             } else {
-                let f: Constructor = ctx.globals().get("Function").catch(ctx)?;
-                f.construct::<_, Value>((code,)).catch(ctx)?;
-            }
-            Ok(Value::new_undefined(ctx.clone()))
+                ctx.globals()
+                    .get::<_, Constructor>("Function")
+                    .and_then(|f| f.construct::<_, Value>((code,)))
+                    .map(|_| ())
+            };
+            r.catch(&ctx).map_err(|e| self.map_err(&ctx, e))
         })
-        .map(|_| ())
     }
 
     fn add_static_module(&self, name: &str, source: &str) {

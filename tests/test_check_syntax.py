@@ -18,3 +18,11 @@ def test_does_not_execute():
     rt = Runtime()
     rt.check_syntax("globalThis.ran = true")
     assert rt.eval("typeof ran") is None or rt.eval("typeof ran") == "undefined"
+
+
+def test_guest_cannot_hijack_check():
+    rt = Runtime()
+    rt.eval("globalThis.hit = 0; globalThis.Function = function () { hit++ }; 0")
+    with pytest.raises(JavaScriptError):
+        rt.check_syntax("const = ;")
+    assert rt.eval("hit") == 0

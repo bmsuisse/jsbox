@@ -1,3 +1,4 @@
+mod natives;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -446,9 +447,10 @@ impl Runtime {
     /// `on_console(level, args)` receives `console.*` calls; `lossy=True`
     /// turns unconvertible JS results (functions, symbols, cycles) into
     /// placeholder strings instead of raising. `max_pending_calls` bounds the
-    /// async host calls in flight at once.
+    /// async host calls in flight at once. `buffer=True` installs a small Node-compatible
+    /// `Buffer` (a `Uint8Array` subclass) that JSZip/pptxgenjs detect and use for fast UTF-8.
     #[new]
-    #[pyo3(signature = (memory_limit=DEFAULT_MEMORY, max_stack_size=DEFAULT_STACK, max_value_bytes=DEFAULT_VALUE_BYTES, on_console=None, lossy=false, max_pending_calls=DEFAULT_MAX_PENDING))]
+    #[pyo3(signature = (memory_limit=DEFAULT_MEMORY, max_stack_size=DEFAULT_STACK, max_value_bytes=DEFAULT_VALUE_BYTES, on_console=None, lossy=false, max_pending_calls=DEFAULT_MAX_PENDING, buffer=false))]
     fn new(
         memory_limit: usize,
         max_stack_size: usize,
@@ -456,6 +458,7 @@ impl Runtime {
         on_console: Option<Py<PyAny>>,
         lossy: bool,
         max_pending_calls: usize,
+        buffer: bool,
     ) -> PyResult<Self> {
         let rt = rquickjs::Runtime::new().map_err(val_err)?;
         rt.set_memory_limit(memory_limit);
@@ -473,7 +476,7 @@ impl Runtime {
         let modules: Modules = Rc::default();
         rt.set_loader(StaticResolver(modules.clone()), StaticLoader(modules.clone()));
         let ctx = rquickjs::Context::full(&rt).map_err(val_err)?;
-        ctx.with(|ctx| install_console(&ctx, on_console, max_value_bytes).and_then(|()| install_web_bytes(&ctx))).map_err(val_err)?;
+        ctx.with(|ctx| install_console(&ctx, on_console, max_value_bytes).and_then(|()| install_web_bytes(&ctx)).and_then(|()| natives::install(&ctx, buffer))).map_err(val_err)?;
         Ok(Self {
             ctx,
             deadline,

@@ -144,6 +144,8 @@ rt.eval("console.log('hi', [1, 2]); console.error('oops')")  # log ['hi', [1, 2]
 rt.eval("({ok: true, run() {}})")  # {'ok': True, 'run': '[function]'}
 ```
 
+`Runtime(buffer=True)` installs a small Node-style `Buffer` (a non-enumerable `Uint8Array` subclass, no I/O). JSZip and pptxgenjs detect it and UTF-8-encode through it, which makes a pptxgenjs `write()` about 20% faster; it is off by default so guests still see a non-Node environment.
+
 `console.*` is a no-op without `on_console`. With `lossy=True`, functions, symbols and cycles in a
 result become `"[function]"`, `"[symbol]"`, `"[Circular]"` instead of raising.
 

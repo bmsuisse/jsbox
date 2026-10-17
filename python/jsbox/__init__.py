@@ -16,8 +16,8 @@ class Runtime(_jsbox.Runtime):
         """
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
+        self._begin_async(code, timeout)  # raises (without touching a running call) if the Runtime is busy
         try:
-            self._begin_async(code, timeout)
             while True:
                 done, result = self._poll()
                 if done:

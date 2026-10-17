@@ -169,7 +169,7 @@ the guest calls the library, and bytes come back as `bytes`. The test suite runs
 | A bound Python function raises | **the original exception**, re-raised unchanged |
 | Value cannot be converted | `TypeError` / `ValueError` |
 
-JS that catches a host error sees only `host function failed: <ExceptionClass> [#n]`. The
+JS that catches a host error sees only `host function failed: <ExceptionClass>`. The
 message of your Python exception (paths, secrets, internals) never reaches the guest.
 
 ## Examples
@@ -227,13 +227,23 @@ it can *do* is exactly what you bound.
 
 - **No ambient authority.** No `require`, `process`, `fetch`, `setTimeout`, file or network access.
 - **Heap, stack and copy limits with safe defaults.** `memory_limit` (64 MB), `max_stack_size`
-  (1 MB), `max_value_bytes` (16 MB per conversion). Pass `0` to `memory_limit` or
-  `max_stack_size` to disable them.
+  (1 MB, at most 4 MB: a larger limit would let guest recursion overflow the native stack and
+  crash the process, so it is rejected), `max_value_bytes` (16 MB, shared by all arguments of one
+  host call or `console` call, and per conversion of a result). Pass `0` to `memory_limit` to
+  disable the heap limit.
 - **Timeouts you cannot swallow.** `timeout=` interrupts the interpreter loop; `try/catch` in the
   guest cannot catch it, and it also covers property getters hit while converting the result.
-  **It cannot interrupt a single long native operation**: a catastrophic regular expression
-  (`/^(a+)+$/.test('a'.repeat(40) + 'b')`) runs to completion, and some builtins (huge `BigInt`
-  powers) overshoot the deadline. See below.
+  **There is no default timeout**: without `timeout=`, `while(true){}` runs forever. The deadline
+  is checked every few thousand interpreter operations, so **it cannot interrupt a single long
+  native operation**, and a loop whose every iteration does heavy native work overshoots
+  badly. Known cases: `BigInt` powers and parsing of huge digit strings, `sort`/`reverse`/`join`
+  on arrays of length near 2^32, `splice` on million-element arrays, huge `normalize`/`replaceAll`.
+  (Catastrophic regular expressions do stop on time.) The same applies to slow host callbacks,
+  `console` callbacks and conversion of huge arguments: the timeout fires once they return.
+- **Host `BaseException`s** (`KeyboardInterrupt`, `SystemExit`) raised by a bound function stop the
+  script and propagate to the caller; the guest cannot catch them.
+- **One call at a time per `Runtime`.** Calling `eval` from inside a host function, or overlapping
+  `eval_async` calls on one `Runtime`, raises `RuntimeError`. Use one `Runtime` per task.
 - **Host errors are not guest-readable**, and a swallowed host error is never blamed on a later,
   unrelated JS error.
 - **Isolated runtimes.** Two `Runtime`s share nothing; a `Runtime` is bound to its thread.
@@ -242,7 +252,7 @@ What this is **not**: QuickJS is a C engine in your process. A memory-safety bug
 in your process, so for hostile multi-tenant workloads also use OS-level isolation (a container
 or a separate process). Bound host functions are privileged code you wrote, so keep them narrow.
 A timeout cannot interrupt a Python callback that is itself stuck (it fires as soon as that
-callback returns), nor a runaway regular expression: **for untrusted code, run the `Runtime` in
+callback returns), nor a single long native operation: **for untrusted code, run the `Runtime` in
 a process you can kill** (or reject patterns up front). A built-in hard kill is the open item.
 
 ## Limitations
@@ -258,6 +268,10 @@ a process you can kill** (or reject patterns up front). A built-in hard kill is 
   crossings are where it wins: creating a runtime ≈ 0.2 ms, a complete host call (JS to Python and
   back) ≈ 0.5 µs, `eval('1+1')` ≈ 2 µs.
 - Python ints outside `i64` cannot be sent in.
+- `performance.now()` and `Date` expose a real clock and the host's timezone to the guest; strict
+  mode turns `Map`/`Date`/`RegExp` results into `{}` (use `lossy=True` to get JSON-shaped values).
+- A `bind_object` dict key `__proto__` sets the bound object's prototype (it does not pollute
+  `Object.prototype`).
 
 ## Development
 

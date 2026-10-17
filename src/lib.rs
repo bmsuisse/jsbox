@@ -104,6 +104,19 @@ impl Loader for StubLoader {
     }
 }
 
+/// Largest accepted `max_stack_size`: the native stack of a worker thread is the real limit,
+/// and QuickJS segfaults the host if its own limit lies beyond it.
+const MAX_STACK_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Marks a Runtime as running; dropped on every exit path.
+struct BusyGuard<'a>(&'a Cell<bool>);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 fn val_err(e: rquickjs::Error) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
@@ -203,6 +216,11 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
             s.into_pyobject(py)?.into_any().unbind()
         }
         Type::Array => {
+            // Past i32 range rquickjs' array iterator asserts (a Rust panic); refuse instead.
+            let len: f64 = v.as_object().unwrap().get("length").map_err(val_err)?;
+            if len >= f64::from(i32::MAX) {
+                return Err(PyValueError::new_err("array too long to convert"));
+            }
             let list = PyList::empty(py);
             for item in v.as_array().unwrap().iter::<Value>() {
                 list.append(to_py(py, &item.map_err(val_err)?, depth + 1, b)?)?;
@@ -345,16 +363,33 @@ struct HostCtx {
     max_value_bytes: usize,
     max_pending: usize,
     lossy: bool,
+    /// A host `BaseException` (KeyboardInterrupt, SystemExit, ...): never catchable by the guest.
+    /// It stops the script like a timeout and is re-raised to the caller.
+    fatal: RefCell<Option<PyErr>>,
+    deadline: Rc<Cell<Option<Instant>>>,
+}
+
+impl HostCtx {
+    /// Returns true if `e` was recorded as fatal (and the interrupt armed).
+    fn record_fatal(&self, py: Python<'_>, e: &PyErr) -> bool {
+        if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
+            return false;
+        }
+        *self.fatal.borrow_mut() = Some(e.clone_ref(py));
+        self.deadline.set(Some(Instant::now()));
+        true
+    }
 }
 
 fn host_function<'js>(ctx: &Ctx<'js>, func: Py<PyAny>, h: Rc<HostCtx>) -> rquickjs::Result<Function<'js>> {
     Function::new(ctx.clone(), move |ctx: Ctx<'js>, args: Rest<Value<'js>>| -> rquickjs::Result<Value<'js>> {
         Python::attach(|py| {
             let call = || -> PyResult<Value<'js>> {
+                let budget = Budget::new(h.max_value_bytes, h.lossy);
                 let a = args
                     .0
                     .iter()
-                    .map(|v| to_py(py, v, 0, &Budget::new(h.max_value_bytes, h.lossy)))
+                    .map(|v| to_py(py, v, 0, &budget))
                     .collect::<PyResult<Vec<_>>>()?;
                 let r = func.call1(py, PyTuple::new(py, a)?)?;
                 let r = r.bind(py);
@@ -383,7 +418,10 @@ fn host_function<'js>(ctx: &Ctx<'js>, func: Py<PyAny>, h: Rc<HostCtx>) -> rquick
             };
             match call() {
                 Ok(v) => Ok(v),
-                Err(e) => host_failure(&ctx, &h.host_err, py, e).and_then(|v| Err(ctx.throw(v))),
+                Err(e) => {
+                    h.record_fatal(py, &e);
+                    host_failure(&ctx, &h.host_err, py, e).and_then(|v| Err(ctx.throw(v)))
+                }
             }
         })
     })
@@ -452,11 +490,12 @@ fn install_console<'js>(ctx: &Ctx<'js>, cb: Option<Py<PyAny>>, max: usize) -> rq
         let f = Function::new(ctx.clone(), move |args: Rest<Value<'js>>| -> rquickjs::Result<()> {
             if let Some(cb) = &cb {
                 Python::attach(|py| {
+                    let budget = Budget::new(max, true);
                     let a: Vec<Py<PyAny>> = args
                         .0
                         .iter()
                         .map(|v| {
-                            to_py(py, v, 0, &Budget::new(max, true))
+                            to_py(py, v, 0, &budget)
                                 .unwrap_or_else(|_| "[unprintable]".into_pyobject(py).unwrap().into_any().unbind())
                         })
                         .collect();
@@ -489,6 +528,7 @@ struct Runtime {
     timed_out: Rc<Cell<bool>>,
     h: Rc<HostCtx>,
     modules: Modules,
+    busy: Cell<bool>,
 }
 
 #[pymethods]
@@ -511,6 +551,11 @@ impl Runtime {
         max_pending_calls: usize,
         buffer: bool,
     ) -> PyResult<Self> {
+        if max_stack_size == 0 || max_stack_size > MAX_STACK_LIMIT {
+            return Err(PyValueError::new_err(format!(
+                "max_stack_size must be between 1 and {MAX_STACK_LIMIT} bytes (a larger limit lets guest recursion overflow the native stack and crash the process)"
+            )));
+        }
         let rt = rquickjs::Runtime::new().map_err(val_err)?;
         rt.set_memory_limit(memory_limit);
         rt.set_max_stack_size(max_stack_size);
@@ -542,7 +587,7 @@ impl Runtime {
         .map_err(val_err)?;
         Ok(Self {
             ctx,
-            deadline,
+            deadline: deadline.clone(),
             total: Cell::new(None),
             timed_out,
             h: Rc::new(HostCtx {
@@ -551,8 +596,11 @@ impl Runtime {
                 max_value_bytes,
                 max_pending: max_pending_calls,
                 lossy,
+                fatal: RefCell::new(None),
+                deadline: deadline.clone(),
             }),
             modules,
+            busy: Cell::new(false),
         })
     }
 
@@ -628,6 +676,13 @@ impl Runtime {
 
     fn _begin_async(&self, py: Python<'_>, code: &str, timeout: Option<f64>) -> PyResult<()> {
         let dl = parse_timeout(timeout)?;
+        if self.busy.get() || self.h.asy.active.get() {
+            return Err(PyRuntimeError::new_err(
+                "Runtime is busy: another eval/eval_async is in progress (use one Runtime per concurrent task)",
+            ));
+        }
+        let _busy = BusyGuard(&self.busy);
+        self.busy.set(true);
         self.timed_out.set(false);
         self.total.set(dl);
         self.deadline.set(dl);
@@ -639,13 +694,21 @@ impl Runtime {
             Ok(())
         });
         self.deadline.set(None);
-        let _ = py;
+        let out = self.finish(out.map(|()| py.None())).map(|_| ());
+        if out.is_err() {
+            self.ctx.with(|ctx| {
+                self.h.asy.release(py, &ctx);
+                clear_stash(&ctx, &self.h.host_err);
+            });
+        }
         out
     }
 
     /// Returns `(True, result)` when the script's promise settled, else
     /// `(False, [(id, task), ...])` for the host to await.
     fn _poll(&self, py: Python<'_>) -> PyResult<(bool, Py<PyAny>)> {
+        let _busy = BusyGuard(&self.busy);
+        self.busy.set(true);
         self.deadline.set(self.total.get());
         let out = self.ctx.with(|ctx| -> PyResult<(bool, Py<PyAny>)> {
             while !self.timed_out.get() && ctx.execute_pending_job() {}
@@ -680,6 +743,10 @@ impl Runtime {
             }
         });
         self.deadline.set(None);
+        if let Some(fatal) = self.h.fatal.borrow_mut().take() {
+            self.timed_out.set(false);
+            return Err(fatal);
+        }
         out
     }
 
@@ -729,6 +796,34 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    /// Refuses re-entrant calls (eval from inside a host function) and calls that overlap an
+    /// `eval_async` in progress; both would otherwise hit RefCell double borrows.
+    fn enter(&self) -> PyResult<BusyGuard<'_>> {
+        if self.busy.get() || self.h.asy.active.get() {
+            return Err(PyRuntimeError::new_err(
+                "Runtime is busy: re-entrant or overlapping calls are not supported \
+                 (do not call eval from a host function, and do not overlap eval_async calls)",
+            ));
+        }
+        self.busy.set(true);
+        Ok(BusyGuard(&self.busy))
+    }
+
+    /// A host `BaseException` wins over whatever the stopped script produced.
+    fn finish(&self, out: PyResult<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        if let Some(fatal) = self.h.fatal.borrow_mut().take() {
+            self.timed_out.set(false);
+            return Err(fatal);
+        }
+        match out {
+            // A deadline hit during error formatting (hostile getters) is still a timeout.
+            Err(e) if self.timed_out.get() && !Python::attach(|py| e.is_instance_of::<JsTimeoutError>(py)) => {
+                Err(JsTimeoutError::new_err("script exceeded its timeout"))
+            }
+            other => other,
+        }
+    }
+
     /// Scripts run sloppy like a browser/V8 script; rquickjs defaults to strict.
     fn eval_script<'js>(ctx: &Ctx<'js>, code: &str) -> Result<Value<'js>, CaughtError<'js>> {
         let mut o = EvalOptions::default();
@@ -743,6 +838,7 @@ impl Runtime {
         f: impl for<'js> FnOnce(&Ctx<'js>) -> Result<Value<'js>, CaughtError<'js>>,
     ) -> PyResult<Py<PyAny>> {
         let deadline = parse_timeout(timeout)?;
+        let _busy = self.enter()?;
         self.timed_out.set(false);
         self.deadline.set(deadline);
         let out = self.ctx.with(|ctx| {
@@ -752,7 +848,7 @@ impl Runtime {
             r
         });
         self.deadline.set(None);
-        out
+        self.finish(out)
     }
 
     fn run_in<'js>(
@@ -770,7 +866,12 @@ impl Runtime {
         // normalizer itself fails (interrupt), convert the raw value as before.
         let normalized = if self.h.lossy && v.is_object() {
             let f = ctx.userdata::<Plain>().map(|p| p.0.clone());
-            f.and_then(|f| f.call::<_, Value>((v.clone(),)).ok())
+            let r = f.map(|f| f.call::<_, Value>((v.clone(),)));
+            if self.timed_out.get() {
+                let _ = ctx.catch();
+                return Err(JsTimeoutError::new_err("script exceeded its timeout"));
+            }
+            r.and_then(Result::ok)
         } else {
             None
         };
@@ -823,6 +924,20 @@ impl Runtime {
     }
 }
 
+/// Text for a thrown non-Error value. Primitives only: no guest code runs and no heap address leaks.
+fn describe_thrown(v: &Value<'_>) -> String {
+    match v.type_of() {
+        Type::String | Type::Int | Type::Float | Type::Bool | Type::BigInt => {
+            v.get::<Coerced<String>>().map(|s| s.0).unwrap_or_default()
+        }
+        Type::Null => "null".into(),
+        Type::Undefined | Type::Uninitialized => "undefined".into(),
+        Type::Symbol => "Symbol()".into(),
+        Type::Function | Type::Constructor => "[function]".into(),
+        _ => "[object]".into(),
+    }
+}
+
 /// Convert a caught JS error to `JavaScriptError` without touching any runtime state.
 fn plain_js_error(e: &CaughtError<'_>) -> PyErr {
     let (name, message, stack) = match e {
@@ -831,7 +946,7 @@ fn plain_js_error(e: &CaughtError<'_>) -> PyErr {
             x.message().unwrap_or_default(),
             x.stack().unwrap_or_default(),
         ),
-        CaughtError::Value(v) => (None, format!("{v:?}"), String::new()),
+        CaughtError::Value(v) => (None, describe_thrown(v), String::new()),
         CaughtError::Error(rquickjs::Error::Unknown) => {
             (None, "promise never settled (no pending jobs)".to_string(), String::new())
         }

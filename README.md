@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="jsbox" width="240">
-
-# jsbox
+<img src="assets/logo.svg" alt="jsbox" width="340">
 
 **A small JavaScript sandbox for Python**
 

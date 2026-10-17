@@ -222,8 +222,12 @@ fn to_py<'js>(py: Python<'_>, v: &Value<'js>, depth: usize, b: &Budget) -> PyRes
                 return Err(PyValueError::new_err("array too long to convert"));
             }
             let list = PyList::empty(py);
-            for item in v.as_array().unwrap().iter::<Value>() {
-                list.append(to_py(py, &item.map_err(val_err)?, depth + 1, b)?)?;
+            // Index loop over the length read once above: the guest cannot change how many
+            // elements are visited, and rquickjs' iterator (which re-reads `length`) is avoided.
+            let arr = v.as_array().unwrap();
+            for i in 0..len as usize {
+                let item: Value = arr.get(i).map_err(val_err)?;
+                list.append(to_py(py, &item, depth + 1, b)?)?;
             }
             list.into_any().unbind()
         }

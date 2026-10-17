@@ -107,7 +107,8 @@ impl Loader for StubLoader {
 /// Native builtins are not interruptible, and a few have no bound: `Array(2**32-1).sort()` or
 /// `BigInt('9'.repeat(200000))` hold the host thread for minutes regardless of `timeout=`. These
 /// wrappers refuse the degenerate sizes up front (arrays past 2**26 elements are far beyond the
-/// default heap anyway; BigInt parsing is quadratic).
+/// default heap anyway; BigInt parsing is quadratic). Best effort, not a boundary: an array-like
+/// with a getter for `length` can still slip through; use `run_killable` for untrusted code.
 const NATIVE_GUARDS_JS: &str = r#"(function () {
   const MAX_ARRAY = 2 ** 26, MAX_DIGITS = 32768;
   const def = (o, k, v) => Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false });
@@ -125,6 +126,7 @@ const NATIVE_GUARDS_JS: &str = r#"(function () {
   const B = BigInt;
   const NB = function BigInt(v) {
     if (new.target) throw new TypeError('BigInt is not a constructor');
+    if (typeof v === 'object' && v !== null) v = String(v); // coerce first, so an object cannot smuggle a long string past the check
     if (typeof v === 'string' && v.length > MAX_DIGITS) throw new RangeError('BigInt string too long');
     return B(v);
   };

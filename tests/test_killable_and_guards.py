@@ -50,3 +50,9 @@ def test_run_killable_kills_what_timeout_cannot_interrupt():
 def test_run_killable_passes_runtime_options():
     with pytest.raises(JavaScriptError):
         run_killable("'x'.repeat(50_000_000).length", timeout=5, memory_limit=8 * 1024 * 1024)
+
+
+def test_bigint_guard_cannot_be_bypassed_with_an_object():
+    with pytest.raises(JavaScriptError, match="too long"):
+        Runtime().eval("BigInt({toString() { return '1'.repeat(200000) }})", timeout=1)
+    assert Runtime().eval("BigInt(new Number(5))") == 5

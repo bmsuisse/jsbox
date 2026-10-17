@@ -255,7 +255,9 @@ it can *do* is exactly what you bound.
   badly. Known cases: `BigInt` powers, `splice` in a loop over million-element arrays, huge
   `normalize`/`replaceAll`. (Catastrophic regular expressions do stop on time. The worst offenders
   are refused up front: array methods such as `sort`/`reverse`/`join`/`fill` on arrays longer than
-  2^26 and `BigInt()` of strings over 32768 characters throw a `RangeError`.) The same applies to slow host callbacks,
+  2^26 and `BigInt()` of strings over 32768 characters throw a `RangeError`. These guards are best-effort,
+  for example an array-like object with a `length` getter can slip past them: use `run_killable`
+  when the code is untrusted.) The same applies to slow host callbacks,
   `console` callbacks and conversion of huge arguments: the timeout fires once they return.
 - **Host `BaseException`s** (`KeyboardInterrupt`, `SystemExit`) raised by a bound function stop the
   script and propagate to the caller; the guest cannot catch them.

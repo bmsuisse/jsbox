@@ -172,6 +172,13 @@ the guest calls the library, and bytes come back as `bytes`. The test suite runs
 JS that catches a host error sees only `host function failed: <ExceptionClass> [#n]`. The
 message of your Python exception (paths, secrets, internals) never reaches the guest.
 
+## Examples
+
+Runnable scripts live in [`examples/`](examples/) (see its [README](examples/README.md)):
+basics, bindings, type conversion, resource limits, ES modules, agent tool calling, and
+**Monty + jsbox** pipelines where the model's Python runs in [Monty](https://github.com/pydantic/monty)
+and its JavaScript runs in jsbox (Vega-Lite, d3, ECharts, three.js, turf, pptxgenjs).
+
 ## Security model
 
 There is no permission system to configure. A fresh `Runtime` can compute and nothing else; what

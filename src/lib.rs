@@ -7,9 +7,9 @@ use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 
 use rquickjs::module::Declared;
 use rquickjs::prelude::Rest;
-use rquickjs::{
+use rquickjs::{qjs, 
     context::EvalOptions, convert::Coerced, ArrayBuffer, Atom, CatchResultExt, CaughtError, Ctx,
-    Constructor, Exception, Function, Module, Object, Persistent, Promise, Type, TypedArray, Value,
+    Exception, Function, Module, Object, Persistent, Promise, Type, TypedArray, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -85,6 +85,22 @@ impl Loader for StaticLoader {
             Some(s) => Module::declare(ctx.clone(), name, s),
             None => Err(Exception::throw_message(ctx, &format!("module not found: {name}"))),
         }
+    }
+}
+
+/// `check_syntax(module=True)` only parses: every import resolves to an empty stub module.
+struct StubResolver;
+struct StubLoader;
+
+impl Resolver for StubResolver {
+    fn resolve<'js>(&mut self, _: &Ctx<'js>, _: &str, name: &str, _: Option<ImportAttributes<'js>>) -> rquickjs::Result<String> {
+        Ok(name.to_string())
+    }
+}
+
+impl Loader for StubLoader {
+    fn load<'js>(&mut self, ctx: &Ctx<'js>, name: &str, _: Option<ImportAttributes<'js>>) -> rquickjs::Result<Module<'js, Declared>> {
+        Module::declare(ctx.clone(), name, "")
     }
 }
 
@@ -561,24 +577,27 @@ impl Runtime {
         })
     }
 
-    /// Parse `code` without running it; raises `JavaScriptError` (SyntaxError) if invalid.
-    /// Scripts are checked as a function body, so top-level `return` is accepted.
-    /// Uses a throwaway pristine context, so guest state (e.g. a replaced
-    /// `Function`) can never influence or run during the check.
+    /// Parse `code` without running it (QuickJS compile-only); raises `JavaScriptError`
+    /// (SyntaxError) if invalid. Scripts are checked exactly as `eval` would parse them.
+    /// Runs in a throwaway pristine context, so guest state never takes part.
     #[pyo3(signature = (code, module=false))]
     fn check_syntax(&self, code: &str, module: bool) -> PyResult<()> {
         let rt = rquickjs::Runtime::new().map_err(val_err)?;
         rt.set_memory_limit(DEFAULT_MEMORY);
         rt.set_max_stack_size(DEFAULT_STACK);
+        rt.set_loader(StubResolver, StubLoader);
         let ctx = rquickjs::Context::full(&rt).map_err(val_err)?;
         ctx.with(|ctx| -> PyResult<()> {
-            let r = if module {
-                Module::declare(ctx.clone(), "check", code).map(|_| ())
-            } else {
-                ctx.globals()
-                    .get::<_, Constructor>("Function")
-                    .and_then(|f| f.construct::<_, Value>((code,)))
-                    .map(|_| ())
+            let kind = if module { qjs::JS_EVAL_TYPE_MODULE } else { qjs::JS_EVAL_TYPE_GLOBAL };
+            let flags = (kind | qjs::JS_EVAL_FLAG_COMPILE_ONLY) as std::os::raw::c_int;
+            // SAFETY: ctx is live; code/len describe a valid buffer, the filename is NUL-terminated;
+            // COMPILE_ONLY never executes the source, and the returned value is freed here.
+            let r: rquickjs::Result<()> = unsafe {
+                let raw = ctx.as_raw().as_ptr();
+                let v = qjs::JS_Eval(raw, code.as_ptr().cast(), code.len() as _, c"check".as_ptr(), flags);
+                let failed = v.tag == qjs::JS_TAG_EXCEPTION as i64;
+                qjs::JS_FreeValue(raw, v);
+                if failed { Err(rquickjs::Error::Exception) } else { Ok(()) }
             };
             r.catch(&ctx).map_err(|e| plain_js_error(&e))
         })

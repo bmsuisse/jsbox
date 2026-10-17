@@ -16,6 +16,7 @@ The model's Python runs in [Monty](https://github.com/pydantic/monty) (`pip inst
 its JavaScript in jsbox, both calling the same host tools. Vendored bundles live in `vendor/libs`
 (`_sandbox.py` loads them; `_polyfills.py` adds virtual-time timers and friends).
 
+- `monty_three_quickstart.py` – smallest pipeline: Monty height field to three.js `.glb` (the README example)
 - `monty_and_jsbox.py` – shared tool budget, Vega-Lite chart (`sales.svg`)
 - `monty_sql_charts.py` – SQLite question answered in Monty, Vega-Lite SVGs
 - `monty_echarts_dashboard.py` – anomaly detection, ECharts `dashboard.html`

@@ -160,6 +160,22 @@ run unmodified: the host prepends the bundle (and a few byte-plumbing shims) as 
 the guest calls the library, and bytes come back as `bytes`. The test suite runs these exact files
 (`tests/test_onehub_compat.py`).
 
+### Hard kill
+
+`timeout=` cannot interrupt one long native operation. For untrusted code that must not wedge the
+host, run it in a child process that is killed at the deadline:
+
+```python
+from jsbox import run_killable
+
+run_killable("let x = 3n; for (;;) x = x * x", timeout=1.0)  # JsTimeoutError after ~2 s, process gone
+run_killable("[1, 2, 3].map(x => x * 2)", timeout=5, memory_limit=32 * 1024 * 1024)  # [2, 4, 6]
+```
+
+It costs a process spawn (about 50-100 ms) and runs pure computation only: bound functions and
+modules cannot cross the process boundary. Other keyword arguments go to `Runtime`. For host
+functions, run your own worker process and kill it the same way.
+
 ### Errors
 
 | Situation | Python exception |
@@ -236,9 +252,10 @@ it can *do* is exactly what you bound.
   **There is no default timeout**: without `timeout=`, `while(true){}` runs forever. The deadline
   is checked every few thousand interpreter operations, so **it cannot interrupt a single long
   native operation**, and a loop whose every iteration does heavy native work overshoots
-  badly. Known cases: `BigInt` powers and parsing of huge digit strings, `sort`/`reverse`/`join`
-  on arrays of length near 2^32, `splice` on million-element arrays, huge `normalize`/`replaceAll`.
-  (Catastrophic regular expressions do stop on time.) The same applies to slow host callbacks,
+  badly. Known cases: `BigInt` powers, `splice` in a loop over million-element arrays, huge
+  `normalize`/`replaceAll`. (Catastrophic regular expressions do stop on time. The worst offenders
+  are refused up front: array methods such as `sort`/`reverse`/`join`/`fill` on arrays longer than
+  2^26 and `BigInt()` of strings over 32768 characters throw a `RangeError`.) The same applies to slow host callbacks,
   `console` callbacks and conversion of huge arguments: the timeout fires once they return.
 - **Host `BaseException`s** (`KeyboardInterrupt`, `SystemExit`) raised by a bound function stop the
   script and propagate to the caller; the guest cannot catch them.
@@ -253,7 +270,7 @@ in your process, so for hostile multi-tenant workloads also use OS-level isolati
 or a separate process). Bound host functions are privileged code you wrote, so keep them narrow.
 A timeout cannot interrupt a Python callback that is itself stuck (it fires as soon as that
 callback returns), nor a single long native operation: **for untrusted code, run the `Runtime` in
-a process you can kill** (or reject patterns up front). A built-in hard kill is the open item.
+a process you can kill** (or reject patterns up front). `run_killable` is the built-in hard kill for pure computation.
 
 ## Limitations
 

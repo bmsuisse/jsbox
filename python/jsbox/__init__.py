@@ -2,6 +2,7 @@ import asyncio
 
 from jsbox import _jsbox
 from jsbox._jsbox import JavaScriptError, JsTimeoutError
+from jsbox._killable import run_killable
 
 
 class Runtime(_jsbox.Runtime):
@@ -37,4 +38,4 @@ class Runtime(_jsbox.Runtime):
             self._end_async()
 
 
-__all__ = ["JavaScriptError", "JsTimeoutError", "Runtime"]
+__all__ = ["JavaScriptError", "JsTimeoutError", "Runtime", "run_killable"]

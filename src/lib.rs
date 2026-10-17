@@ -104,6 +104,36 @@ impl Loader for StubLoader {
     }
 }
 
+/// Native builtins are not interruptible, and a few have no bound: `Array(2**32-1).sort()` or
+/// `BigInt('9'.repeat(200000))` hold the host thread for minutes regardless of `timeout=`. These
+/// wrappers refuse the degenerate sizes up front (arrays past 2**26 elements are far beyond the
+/// default heap anyway; BigInt parsing is quadratic).
+const NATIVE_GUARDS_JS: &str = r#"(function () {
+  const MAX_ARRAY = 2 ** 26, MAX_DIGITS = 32768;
+  const def = (o, k, v) => Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false });
+  const apply = Reflect.apply;
+  for (const name of ['sort', 'reverse', 'join', 'copyWithin', 'fill', 'toSorted', 'toReversed', 'toSpliced', 'flat', 'flatMap']) {
+    const orig = Array.prototype[name];
+    if (typeof orig !== 'function') continue;
+    const w = { [name](...args) {
+      if (this != null && this.length > MAX_ARRAY) throw new RangeError('array too large for Array.prototype.' + name);
+      return apply(orig, this, args);
+    } }[name];
+    def(w, 'length', orig.length);
+    def(Array.prototype, name, w);
+  }
+  const B = BigInt;
+  const NB = function BigInt(v) {
+    if (new.target) throw new TypeError('BigInt is not a constructor');
+    if (typeof v === 'string' && v.length > MAX_DIGITS) throw new RangeError('BigInt string too long');
+    return B(v);
+  };
+  NB.prototype = B.prototype;
+  def(NB, 'asIntN', B.asIntN); def(NB, 'asUintN', B.asUintN);
+  def(B.prototype, 'constructor', NB);
+  def(globalThis, 'BigInt', NB);
+})()"#;
+
 /// Largest accepted `max_stack_size`: the native stack of a worker thread is the real limit,
 /// and QuickJS segfaults the host if its own limit lies beyond it.
 const MAX_STACK_LIMIT: usize = 4 * 1024 * 1024;
@@ -580,6 +610,7 @@ impl Runtime {
             install_console(&ctx, on_console, max_value_bytes)
                 .and_then(|()| install_web_bytes(&ctx))
                 .and_then(|()| natives::install(&ctx, buffer))
+                .and_then(|()| ctx.eval::<(), _>(NATIVE_GUARDS_JS))
                 .and_then(|()| {
                     if lossy {
                         let f: Function = ctx.eval(PLAIN_JS)?;

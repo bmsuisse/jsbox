@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 160" width="320" height="160" role="img" aria-labelledby="t">
+  <title id="t">jsbox</title>
+  <style>
+    :root { --fg: #1f2328; }
+    @media (prefers-color-scheme: dark) { :root { --fg: #e6edf3; } }
+    .frame { fill: none; stroke: var(--fg); stroke-width: 3; stroke-linecap: round; stroke-dasharray: 400; stroke-dashoffset: 400; animation: frame 7s ease-in-out infinite; }
+    .tile { animation: tile 7s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+    .js { fill: #F7DF1E; }
+    .jt { font: 700 17px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1a1a1a; }
+    .wm { font: 500 32px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--fg); animation: wm 7s ease-in-out infinite; }
+    @keyframes frame { 0%,14% { stroke-dashoffset: 400 } 40%,88% { stroke-dashoffset: 0 } 100% { stroke-dashoffset: 400 } }
+    @keyframes tile { 0%,4% { opacity: 0; transform: scale(.6) } 12%,88% { opacity: 1; transform: scale(1) } 100% { opacity: 0 } }
+    @keyframes wm { 0%,44% { opacity: 0; transform: translateX(-12px) } 62%,88% { opacity: 1; transform: none } 100% { opacity: 0 } }
+  </style>
+  <rect class="frame" x="30" y="30" width="100" height="100" rx="20"/>
+  <g class="tile"><rect class="js" x="82" y="82" width="40" height="40" rx="9"/><text class="jt" x="93" y="110">JS</text></g>
+  <text class="wm" x="150" y="93">jsbox</text>
+</svg>
